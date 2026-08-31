@@ -452,6 +452,78 @@ Built:
   - `init_schema` runs the file whole on every boot, every statement being
     `IF NOT EXISTS`, and then checks one thing at runtime — see the seventh
     decision below.
+- `app/pipeline.py` — orchestration, and the first module that runs the whole
+  thing. `process`, `compare`, `field_diff`, `agreement`, `render_pages`.
+  - `process(data, filename, doc_type, engine_key, clean_images=True,
+    persist=True)` is load → truncate → clean → engine → validate → gate →
+    save, and it never raises. Every stage is caught and a failure comes back
+    as `ProcessResult(status="failed", error=...)`, because the callers are a
+    web handler and a Streamlit form and an exception in either is a stack
+    trace where an answer should be. The stages are not handled equally, and
+    the differences are the design: a file that will not load is fatal to the
+    run because there is nothing to return; a save that fails is logged and
+    swallowed because returning the extraction beats losing it; a page whose
+    cleanup raises is read as it arrived, because a correction is an
+    improvement to a page we can already read and failing over it would throw
+    away one the engine would have managed. Both of the last two leave a note
+    the reviewer sees.
+  - Nothing in it asks which engine ran. `get_engine` turns the request's
+    string into an `Extractor` and everything after that is the interface,
+    which is what makes `compare` a thread pool rather than a mode.
+  - The two kinds of finding are kept apart on the way in and joined on the way
+    out. `validate` produces *issues* — the document disagreeing with itself.
+    The pipeline produces *notes* — pages truncated, a page not cleaned — which
+    are statements about the run and not faults found on the paper. Notes go to
+    `decide_status` as its `warnings` argument, which is what that argument was
+    left there for, and both lists land in `ProcessResult.issues`, which is
+    what the reviewer reads and what `save_document` stores. A validation rule
+    that raises becomes a `validation_failed` issue rather than a lost
+    extraction: an unchecked document deserves review anyway.
+  - Truncation stays `load_document`'s — it reads `settings.max_pages` and is
+    the only place the cap is applied. What the pipeline adds is saying so out
+    loud: an extraction off the first 20 pages of a 400-page file is not wrong
+    so much as partial, and a reviewer who is not told cannot know the totals
+    came off a page nobody read.
+  - Cleaning runs only when `clean_images` *and* there is no trusted text
+    layer. A PDF whose text we trust was rendered from vectors: no skew to
+    remove, no page edge to find in a scene, no lighting gradient — and
+    `crop_to_document` mistaking a printed border for the edge of the paper is
+    a failure this repo has already had once.
+  - `content_hash` is computed here, `sha256` over the uploaded bytes, because
+    this is the last place the bytes exist. That closes the column
+    `documents_content_hash_idx` was indexing nothing for.
+  - `compare(data, filename, doc_type, engine_keys, ...)` loads and cleans
+    once, then runs each engine in a `ThreadPoolExecutor` over the same arrays
+    — one load is cheaper, and more importantly it is the only thing that makes
+    the disagreement mean anything: two engines that were shown different
+    pixels have not been compared. Threads because every engine is waiting on a
+    network call; the pages are read and never written, so there is nothing to
+    copy or lock. Results come back one per key in the order asked, including
+    when the load failed and all N get the same failure, so a caller can zip
+    them against what it requested. `persist` is not a parameter: a comparison
+    is an experiment, and writing N rows for one document would put N answers
+    in the table where the archive expects the one that was accepted. A
+    repeated key is honoured rather than collapsed — the vision engines are not
+    deterministic, so asking one twice is a real question.
+  - `field_diff(results)` is one row per field, one column per engine, plus
+    `agree`. Paths are `app.db.flatten_fields` paths, so a disagreement, the
+    rule that flagged it and the correction row a reviewer eventually writes
+    all name the same cell, and equality is `app.db._same`, so `12` and `12.0`
+    are one number and two engines that both declined have not disagreed. The
+    one rule that is *not* inherited: an engine that returned no document gets
+    an empty column that disagrees on every row. Reading its absence as a page
+    full of nulls would make agreement rise on exactly the runs where one
+    engine fell over, since most fields on most documents are null.
+    `agreement(rows)` is the fraction, computed outside `compare` because
+    `compare` returns N results and the pairing is the caller's to choose.
+  - `render_pages` returns PNG of exactly the pages an engine was given, same
+    `clean_images` switch and same chain, so a reviewer looking at page 2 is
+    looking at what the extraction was read from — crop and lighting included,
+    which change what is legible. PNG and not the engine's JPEG: that one is a
+    wire format sized down for a model. It returns `[]` rather than raising on
+    a file that will not load, because a display helper has no error channel
+    and `process` has already reported the same failure in
+    `ProcessResult.error`.
 - `tests/test_db.py` — 35 tests, no database and no driver. The flatten/diff
   pair carries most of them, because both of its failure modes cost something
   real and neither is visible: a change it misses is a label thrown away at the
@@ -465,6 +537,26 @@ Built:
   the no-op contract for every entry point, one test of which makes any
   `import psycopg*` an `AssertionError` before calling them. `settings` is replaced
   wholesale, so a developer's real `.env` cannot decide an outcome.
+- `tests/test_pipeline.py` — 33 tests, no network, no database, no recogniser.
+  `app.llm.structured_vision` is stubbed with a fixed answer, which is the seam
+  the vision engine reaches through, so what is under test is everything on
+  either side of it: a real PNG through `load_document`, the correction chain,
+  the engine, `app.validate`, the gate and the result the caller gets. The two
+  the task named lead — a synthetic receipt arriving with its fields parsed and
+  a status that is not `failed`, and a corrupt byte string coming back
+  `status="failed"` without raising. Then the 130.00-on-a-115.00-document
+  receipt run end to end for the first time, producing one `total_mismatch` and
+  routing to review at no confidence at all; each failure path separately (an
+  unknown engine key, an unknown `doc_type`, an empty upload, a raising engine,
+  a raising `preprocess_page`, a raising `validate`); the difference between a
+  failed *run* and an engine that returned no *document*, which keeps its
+  `raw_text` and is reviewed rather than reported as failed; the no-database
+  contract and the swallowed save failure; that the sha256 reaching
+  `save_document` is the sha256 of the uploaded bytes; that `compare` loads
+  once, never persists, and returns one result per key even when the load
+  failed; and `field_diff`'s number equality, its numeric path sort and its
+  empty column. `settings` is replaced wholesale in every module that reads it
+  on this path, so a developer's real `.env` cannot decide an outcome.
 
 `sql/schema.sql` and `app/db.py` were run against a real PostgreSQL 16.2 —
 there is no Docker on this machine, so a user-mode cluster on port 55432 rather
@@ -544,7 +636,29 @@ measurement is in the comment on that index; the collation does not matter and
 the character classification is the whole thing, so do not "simplify" the
 warning away on the grounds that the index obviously works.
 
-Not written yet: `app/pipeline.py`, `api/`, `ui/`, `eval.py`.
+The pipeline was run end to end on a real 3-page PDF with no mocking: triage
+found the text layer (5943 characters), `traditional:paddle` took the
+text-layer path and never touched a recogniser, `vlm:gemini` rendered and
+encoded the same three pages to 928 KB of JPEG, and both then failed at the
+model call and came back as `ExtractionResult(document=None)` — one
+`no_document` issue, `needs_review=True`, `status="ok"`, no exception, and the
+traditional engine still carrying the 5943 characters it had already paid for.
+That is the never-raise contract and the keep-what-was-paid-for rule holding on
+real bytes, and it is *not* evidence that either provider works.
+
+**Neither provider has ever been called.** There is no API key on this machine
+and no `.env`, and a key would not be enough: `app/config.py` declares no
+`gemini_api_key`, `openai_api_key` or `llm_provider`, and `Settings` is
+`extra="ignore"`, so a `GEMINI_API_KEY` line in `.env` is dropped before
+`app.llm._setting` ever looks for it and every call ends at
+`LLMError: no API key for provider 'gemini'`. That was measured, not inferred.
+Until those three fields exist in config, no real extraction can happen through
+any of the four engines, and every test in the repo is a test of the code
+around a provider rather than of the provider. `paddleocr` and `pytesseract`
+are not installed either, so the two traditional engines can currently only run
+the PDF text-layer path.
+
+Not written yet: `api/`, `ui/`, `eval.py`.
 
 Known gaps:
 
@@ -560,7 +674,10 @@ Known gaps:
   default, which is a workaround for the Anthropic defaults and not a feature;
   and `settings.llm_enabled` still reports on the Anthropic key, so it is now
   wrong. `.env.example` needs the same fields. Config was outside this task's
-  scope, so none of it was touched.
+  scope, so none of it was touched — and it is now the gap that blocks
+  everything else: with no field to carry a key, `Settings`' `extra="ignore"`
+  drops `GEMINI_API_KEY` out of `.env` silently and every engine fails at the
+  model call. This is the next thing to fix, before `api/` or `ui/`.
 - The page cap has no home in settings. `load_document` takes `max_pages` as a
   keyword argument and otherwise reads `settings.max_pages` if it appears,
   falling back to a module constant. Add the field to `app/config.py` and drop
@@ -568,38 +685,41 @@ Known gaps:
 - The repo carries no pytest configuration, so pytest resolves its rootdir from
   ancestor directories. On the current machine it finds `C:\Users\mooda\setup.cfg`
   and aborts before collection with a `UnicodeDecodeError`, so plain `pytest -q`
-  does not run at all; `pytest -c <any empty ini> --rootdir=. tests` passes 164
+  does not run at all; `pytest -c <any empty ini> --rootdir=. tests` passes 197
   tests. A `pytest.ini` at the repo root fixes it.
-- `coerce_fields` returns `(document, list[Issue])` and `ExtractionResult` has
-  nowhere to put the issues, so an engine can only log them. `ProcessResult`
-  has the `issues` list they belong in, which means either `app/pipeline.py`
-  collects them from the engine somehow or `ExtractionResult` grows a field.
-  Decide it when `app/pipeline.py` is written. The `Issue` shape is already
-  right for either. Both engines log them at WARNING in the meantime — the same
-  placeholder in both, which is at least not two answers, but it is still not
-  the answer: a reviewer cannot see a log line. It matters most on the vision
-  path, where a dropped field is the only signal there is.
-- Nothing calls `app/validate.py` yet. `app/pipeline.py` is what runs it, puts
-  its issues in `ProcessResult.issues` beside the engine's, and sets
-  `needs_review` from `decide_status`. Until then `decide_status`'s `warnings`
-  argument has no producer — it is there for the engine notes the pipeline will
-  have and takes any non-empty sequence, so what goes in it is decided when the
-  pipeline is written, alongside the `Issue` question above.
-  `app/db.py` is already waiting for it: `save_document` writes
-  `ProcessResult.issues` into the `issues` column and sets `status` from
-  `needs_review`, so the pipeline has only to fill the result it already
-  builds.
+- `coerce_fields` returns `(document, list[Issue])` and `ExtractionResult`
+  still has nowhere to put them, so both engines still only log them. The
+  pipeline is written now and this is the answer it did *not* get to give: it
+  can only read what an engine returns, and a field pydantic dropped is not in
+  there. `ExtractionResult` has to grow an `issues` list and both engines have
+  to fill it; `app/pipeline.py` then concatenates it with `validate`'s the way
+  it already concatenates its own notes, and `decide_status` sees it for free.
+  It matters most on the vision path, where a dropped field is the only signal
+  there is, and it is invisible today: a reviewer cannot see a log line.
+- `ProcessResult` grew `status` and `error`, in `app/schemas.py`, which was
+  outside this task's named files. The task required `process` to return
+  `status="failed"` with the message in `error` and neither field existed;
+  `ProcessResult` is the pipeline's own return type, `BaseModel` ignores extra
+  keys so there was no way to carry them from `app/pipeline.py`, and CLAUDE.md
+  had already deferred this file's shape to "when `app/pipeline.py` is
+  written". Both are optional with defaults, so nothing else changed. The one
+  thing to keep straight: `ProcessResult.status` is `ok | failed` and describes
+  the *run*, while `documents.status` in SQL is `pending_review | approved |
+  rejected` and is the review gate's verdict on a document that was read. A
+  failed run has no such verdict, and is not stored.
 - `app/db.py` has no test that touches Postgres. The 41 checks that prove the
   schema live in a script outside the repo, which means they will rot: nothing
   runs them, and the next change to `sql/schema.sql` or to `approve_document`
   passes `pytest` whatever it does to the database. They belong in
   `tests/test_db.py` behind a skip when `DATABASE_URL` is unset, which is also
   the shape the missing recogniser tests want.
-- `save_document` takes `content_hash` as a keyword and computes nothing. The
-  bytes it would hash are read by whoever handled the upload, which is
-  `api/main.py` or `app/pipeline.py`, so until one of them exists the column is
-  null on every row and `documents_content_hash_idx` indexes nothing. Duplicate
-  detection is the feature that is not there yet, not the index.
+- Duplicate detection is still not a feature. `app/pipeline.py` now computes
+  the sha256 and `documents.content_hash` is populated, so
+  `documents_content_hash_idx` has something to index — but nothing ever reads
+  it. Somebody has to decide what a second filing of the same bytes should do,
+  and the index deliberately does not answer: it is not unique, because the
+  same page legitimately arrives twice and refusing the insert would lose the
+  second filing rather than flag it.
 - The `rejected` status has no producer. The `CHECK` admits it and
   `list_documents(status="rejected")` would return it, but nothing writes it: a
   reviewer can approve a document or leave it, and "this page is not what it
@@ -653,10 +773,13 @@ Known gaps:
 - `used_text_layer` has nowhere to live. The traditional engine knows whether
   it read the PDF's text layer or the pixels — the two produce results of very
   different quality and the review UI wants to say which — but
-  `ExtractionResult` carries no such field and `app/schemas.py` was outside
-  this task's scope, so for now the engine only logs it. Add the field, or have
-  `app/pipeline.py` carry the flag; decide it with the `Issue` question above,
-  since both are the same missing channel between an engine and its result.
+  `ExtractionResult` carries no such field, so for now the engine only logs it.
+  `app/pipeline.py` cannot supply it either: it knows `loaded.has_text_layer`
+  but not whether the engine chose to use it, and guessing on the engine's
+  behalf is exactly the branch on engine identity the architecture rule
+  forbids. So this is the same missing channel as the `coerce_fields` issues
+  above and wants the same fix — a field on `ExtractionResult`, filled by the
+  engine that knows.
 - `ExtractionResult.model` comes back `None` from both engines.
   `app.llm.structured_text` and `structured_vision` return the parsed object and
   nothing about which provider or model answered, and neither engine will write
@@ -691,6 +814,34 @@ Known gaps:
   from the docs rather than captured from a run. The kwargs cascade in
   `_construct_paddle` is untested for the same reason. A test marked to skip
   when the backend is absent would cover it.
+- `ProcessResult.comparison` and `agreement` have no producer, and the
+  `documents.comparison` and `agreement` columns are therefore always null.
+  `compare` returns a list of N results and `field_diff`/`agreement` reduce it,
+  which is the right shape for a UI table but not the shape those two fields
+  are: they hold *one* other result and one number, i.e. a pair. Nothing
+  chooses the pair, and nothing should choose it automatically — two of five
+  engines is an arbitrary selection. It is the review UI or the API that knows
+  which comparison a user asked to keep, so this stays open until one of them
+  exists, and the columns keep their argument in `sql/schema.sql` in the
+  meantime.
+- `app/pipeline.py` reaches into `app.db._same` and `app.db._path_key`. Both
+  encode decisions `field_diff` must not answer differently — what counts as
+  the same value, and that `items.2` sorts before `items.10` — and a second
+  copy in the pipeline would drift from the one that writes the corrections
+  rows, so the import is deliberate. They should simply be public on `app.db`;
+  that is a rename and a line in `__all__`, and `app/db.py` was outside this
+  task's files.
+- Nothing measures how long the stages take relative to each other.
+  `ProcessResult.duration_ms` is the whole run and `ExtractionResult.duration_ms`
+  is the engine, so preprocessing is the difference between them and is
+  reported nowhere. On a scanned multi-page PDF the correction chain is not
+  free, and `clean_images=False` is a switch nobody can currently justify
+  turning off with a number.
+- `compare` runs every engine at once by default — `max_workers` defaults to
+  the number of keys. That is right when the engines are waiting on four
+  different providers and wrong when two of them are PaddleOCR, which holds
+  models in memory per language. Nobody has run it with both traditional
+  engines on a large page yet.
 - The correction half has no unit tests. It was verified visually instead — a
   synthetic page shot at 6 degrees on a grey desk under a lighting gradient,
   1200x1500 in, 807x1105 out against an 800x1100 original, residual skew 0.0

@@ -590,6 +590,18 @@ class Issue(BaseModel):
 class ProcessResult(BaseModel):
     """One document through the pipeline, including the review gate and storage outcome."""
 
+    status: Literal["ok", "failed"] = Field(
+        default="ok",
+        description=(
+            "Whether the run itself completed. 'failed' means no extraction was produced and "
+            "`error` says why. This is not documents.status in SQL, which is the review gate's "
+            "verdict on a document that *was* read: a failed run has no such verdict to give."
+        ),
+    )
+    error: str | None = Field(
+        default=None,
+        description="Why the run failed, when it did. None on every completed run.",
+    )
     document_id: str | None = Field(default=None, description="Database id, None when persistence is off.")
     source: str | None = Field(default=None, description="Original filename or upload reference.")
     doc_type: str | None = Field(default=None, description="Key in DOC_TYPES used for this document.")
