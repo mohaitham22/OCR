@@ -1,0 +1,42 @@
+# Runtime dependencies for api/, ui/, app/ and eval.py -- everything except
+# the traditional engine's PaddleOCR backend, which lives in
+# requirements-ocr.txt because it is a roughly 1 GB opt-in, not a default.
+# Tesseract needs no Python-side heavy lift -- pytesseract is a thin wrapper
+# around the `tesseract` binary the Dockerfile installs via apt -- so it stays
+# here.
+#
+# Versions are pinned to what this repo was built and tested against.
+
+# --- API ---------------------------------------------------------------
+fastapi==0.141.1
+uvicorn[standard]==0.44.0
+python-multipart==0.0.32
+
+# --- Schemas and settings ------------------------------------------------
+pydantic==2.13.4
+pydantic-settings==2.13.1
+
+# --- Persistence (app/db.py imports psycopg lazily; the app still boots
+# and runs with DATABASE_URL empty and this package absent) --------------
+psycopg[binary,pool]==3.3.4
+psycopg-pool==3.3.1
+
+# --- Retries around every model call (app/llm.py) ------------------------
+tenacity==8.2.3
+
+# --- Preprocessing (app/preprocess.py): PDF triage, image ops ------------
+numpy==1.26.4
+opencv-python==4.13.0.90
+pymupdf==1.27.2.2
+
+# --- Traditional engine, tesseract backend (app/engines/traditional.py) --
+pytesseract==0.3.13
+
+# --- Vision and text model SDKs (app/llm.py imports both lazily) ---------
+openai==2.15.0
+google-genai==2.10.0
+
+# --- Review UI (ui/streamlit_app.py) --------------------------------------
+streamlit==1.31.0
+pandas==2.3.3
+requests==2.32.3

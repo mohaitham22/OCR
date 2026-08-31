@@ -1,0 +1,55 @@
+# DATABASE_URL for `api` is set here, not in .env: the address of the
+# `postgres` service only exists inside this compose network, and `.env`'s own
+# DATABASE_URL stays empty so the same file works for the no-compose quick
+# start (`uvicorn` and `streamlit` run directly, no Postgres). `ui` reaches
+# storage through the API over HTTP, never directly -- its DATABASE_URL is
+# forced empty for the same reason api/main.py never asks it for one.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ocr
+      POSTGRES_PASSWORD: ocr
+      POSTGRES_DB: ocr
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ocr -d ocr"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://ocr:ocr@postgres:5432/ocr
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  ui:
+    build: .
+    command: ["streamlit", "run", "ui/streamlit_app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+    env_file:
+      - .env
+    environment:
+      API_URL: http://api:8000
+      DATABASE_URL: ""
+    ports:
+      - "8501:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

@@ -1,0 +1,11 @@
+# Opt-in: the traditional engine's PaddleOCR backend (OCR_BACKEND=paddle).
+#
+# Not installed by default -- the Dockerfile's install line for this file is
+# commented out because these two packages add roughly 1 GB to the image, most
+# of it paddlepaddle's own wheel. Uncomment that line (or `pip install -r
+# requirements-ocr.txt` by hand, in or out of the container) to enable
+# traditional:paddle; without it, traditional:tesseract, vlm:gemini and
+# vlm:openai still run.
+
+paddlepaddle==3.3.1
+paddleocr==3.7.0
