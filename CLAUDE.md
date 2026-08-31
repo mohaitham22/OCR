@@ -79,6 +79,58 @@ Built:
     raises `LLMError` on anything else. OpenAI and DeepSeek need it more than
     Gemini does: their portable JSON mode constrains syntax but not shape, so
     those two get the schema as prose in the system message.
+- `app/engines/base.py` — the contract both engines implement, and nothing that
+  reads a page.
+  - `Extractor` is the ABC: `key` (what the registry and the request parameter
+    index on), `label` (what the UI shows), `gives_boxes` (whether
+    `text_blocks` will carry coordinates, so the review UI can ask about the
+    capability instead of about the engine), abstract
+    `extract(pages, doc_type, embedded_text=None) -> ExtractionResult`, and the
+    `_timed` context manager, which yields a reader rather than a number so the
+    result can still be built in one expression at the end of the block.
+    `__init_subclass__` rejects a concrete subclass that leaves `key` or
+    `label` empty: the registry keys on `key`, and a missing one should fail at
+    import, not at the first request.
+  - `SYSTEM_PROMPT` carries the whole extraction policy — transcribe, never
+    translate, never transliterate, Arabic into the Arabic field in Arabic
+    script; amounts as printed, no currency conversion and no arithmetic, so a
+    receipt whose lines disagree with its total returns both and lets
+    `app.validate` find it; dates as YYYY-MM-DD with ambiguous all-numeric
+    dates read day-month-year; unreadable means null, and a null is correct
+    where a guess is not. Both engines send it and neither restates it: a rule
+    added to one engine's prompt and not the other's is how two backends that
+    are supposed to be interchangeable start disagreeing about the same page.
+  - `build_prompt(doc_type, source_text=None)` embeds the schema rather than
+    paraphrasing it — the field descriptions in `app/schemas.py` are the
+    field-level instructions, so a paraphrase would be a second, staler copy of
+    them. The two framings differ only in what they say the model is looking
+    at: `source_text` frames the OCR as evidence and not ground truth, warns
+    about misread characters and wrong reading order (interleaved columns, a
+    total lifted out of its row, Arabic runs reversed or broken across lines),
+    and permits repairing a clearly misread character inside an otherwise
+    legible word while insisting that anything less certain is null. Without
+    it, the prompt states that the page images follow. Schema last in both,
+    closest to the answer.
+  - `compact_schema` prunes the Pydantic schema to what instructs: `$ref`
+    inlined (a model told to fill `items` cannot follow a pointer into a
+    `$defs` it was never shown), `anyOf: [X, null]` collapsed to
+    `"type": ["X", "null"]`, and `title`, `default`, `additionalProperties` and
+    `$schema` dropped. Keys are reordered to type → const → description →
+    properties → items so a field reads as what it is, then what to put in it.
+    It is deliberately *not* `app.llm._gemini_schema`: that one targets
+    Gemini's request-time dialect, which is OpenAPI-shaped and rejects a type
+    array, while this one is read as prose by whichever model is answering.
+    Sharing them would put one provider's spelling of "nullable" into the
+    prompt every provider sees.
+  - `coerce_fields(doc_type, raw)` validates and, on `ValidationError`, drops
+    the values at the failing locations and revalidates, returning the document
+    that survived plus one `Issue` per error — `severity="warning"`,
+    `field` as the dotted path pydantic reported (`items.1.quantity`), so the
+    warning points at the cell the reviewer has to look at. Pruning is safe to
+    do blind because every extracted field is optional. A `loc` the walk cannot
+    follow falls back to dropping the top-level key the path started at, and a
+    pass that removes nothing ends the loop rather than spinning; only then
+    does the document come back as `None`.
 - `tests/test_preprocess.py` — both triage directions, the threshold boundary,
   the page cap, images and failure modes, on PDFs built in memory. Loading
   only; the correction half is not covered yet.
@@ -106,10 +158,13 @@ A third, in `_gemini_schema`, is easy to break by tidying: the keyword filter
 runs on the keys of a schema node, never on the keys of a `properties` map. `Receipt`
 has a field called `items` and `GenericDocument` one called `title`, so a
 filter applied one level too high silently deletes real fields from the schema
-the model is asked to fill. `tests/test_llm.py` pins both.
+the model is asked to fill. `tests/test_llm.py` pins both. `_shrink` in
+`app/engines/base.py` walks the same shape and carries the same trap; it has no
+test yet.
 
 Not written yet: `app/validate.py`, `app/db.py`, `app/pipeline.py`,
-`app/engines/`, `api/`, `ui/`, `sql/`, `eval.py`.
+`app/engines/traditional.py`, `app/engines/vlm.py`, the `app/engines/__init__.py`
+registry, `api/`, `ui/`, `sql/`, `eval.py`.
 
 Known gaps:
 
@@ -135,6 +190,25 @@ Known gaps:
   and aborts before collection with a `UnicodeDecodeError`, so plain `pytest -q`
   does not run at all; `pytest -c <any empty ini> --rootdir=. tests` passes 51
   tests. A `pytest.ini` at the repo root fixes it.
+- `coerce_fields` returns `(document, list[Issue])` and `ExtractionResult` has
+  nowhere to put the issues, so an engine can only log them. `ProcessResult`
+  has the `issues` list they belong in, which means either `app/pipeline.py`
+  collects them from the engine somehow or `ExtractionResult` grows a field.
+  Decide it when `app/pipeline.py` is written, before both engines have
+  invented their own answer. The `Issue` shape is already right for either.
+- OpenAI and DeepSeek see the schema twice: `build_prompt` embeds the compact
+  one and `app.llm._json_instruction` appends the full Pydantic one to the
+  system message. Gemini sees the compact one in the prompt and the sanitised
+  one as `response_schema`, which is fine. Harmless but wasteful for the two
+  `openai`-SDK providers; the fix is for `_json_instruction` to skip the schema
+  when the prompt already carries it, which is a change in `app/llm.py` and was
+  out of scope here.
+- `app/engines/base.py` has no tests. What is worth pinning: that
+  `compact_schema` keeps the `items` and `title` *fields* while dropping the
+  `title` *keyword*, that `build_prompt` produces valid JSON inside `<schema>`
+  after the array-collapsing pass in `_dumps`, that the OCR framing appears
+  only with `source_text`, and each `coerce_fields` path — clean, one bad
+  scalar, a bad line item, a bad `doc_type`, and a non-dict.
 - The correction half has no unit tests. It was verified visually instead — a
   synthetic page shot at 6 degrees on a grey desk under a lighting gradient,
   1200x1500 in, 807x1105 out against an 800x1100 original, residual skew 0.0
