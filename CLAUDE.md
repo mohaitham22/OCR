@@ -910,6 +910,64 @@ below having been a user-mode one that is gone.
   correctly; it is not a statement about `vlm:gemini` or any other engine,
   none of which has an API key to be judged with yet.
 
+- `Dockerfile`, `docker-compose.yml`, `requirements.txt`, `requirements-ocr.txt`
+  and `README.md` — packaging, and the first thing in the repo anyone outside
+  this machine can actually build. One image serves both roles: the
+  Dockerfile's default `CMD` runs uvicorn, and `docker-compose.yml`'s `ui`
+  service runs the same image with its `command` overridden to `streamlit
+  run` instead, because `ui/streamlit_app.py` imports `app.pipeline` and
+  `app.schemas` directly and needs the same dependencies the API does, not a
+  lighter subset. `requirements-ocr.txt` holds `paddlepaddle` and
+  `paddleocr` on their own, opt-in and roughly +1 GB, with the Dockerfile's
+  install line for it commented out; the other three engines run without it.
+  `docker-compose.yml` runs `postgres:16-alpine` with a named volume, `api`
+  pointed at it by a `DATABASE_URL` set only in compose (`.env`'s own stays
+  empty, so the same file also drives the no-Postgres, no-Docker quick
+  start), and `ui` depending on `api` healthy with `DATABASE_URL` forced
+  empty for the reason `api/main.py` never asks it for one either.
+
+  **This machine has no Docker, and none was installed to test this.**
+  Neither natively nor inside the one WSL distribution present (`Ubuntu`,
+  which has no Docker in it either) — the same absence `sql/schema.sql`'s
+  verification already worked around with a user-mode Postgres cluster.
+  There is no equivalent workaround for a container engine, so `docker
+  compose up --build` itself has never been run, and that is not glossed
+  over here: the Dockerfile and compose file are unverified as a build,
+  only as their parts.
+
+  What was proven instead, from a real `git clone` of this repo (not the
+  working tree — see the pin fix below, which is exactly the kind of thing
+  that check exists to catch) into a scratch location outside it: every path
+  the Dockerfile and `docker-compose.yml` reference exists in the clone;
+  `docker-compose.yml` parses as the three services and one volume it is
+  meant to; a clean virtualenv installing `requirements.txt` — the same `pip
+  install -r requirements.txt` line the Dockerfile runs — resolves and
+  completes; the full 197-test suite passes inside that venv; and, run for
+  real with no mocking, `uvicorn api.main:app` (the Dockerfile's own `CMD`)
+  answers `/health` and `/v1/engines` over real HTTP, and `streamlit run
+  ui/streamlit_app.py` (`docker-compose.yml`'s `ui` command, `API_URL`
+  pointed at the running API) serves its page with a real `200`. That is
+  every part Docker would run, run directly; it is not proof that the
+  three-service network, the healthcheck ordering, or the image build
+  itself work, and nothing here claims otherwise.
+
+  The clone step is why `requirements.txt` reads `opencv-python==4.11.0.86`
+  and not `4.13.0.90`: `pip show` on this machine's existing environment
+  reported both that version and `numpy==1.26.4` installed side by side,
+  which is not the same claim as the two being a valid joint resolution. A
+  clean-venv install of the first pin hit pip's `ResolutionImpossible` —
+  `opencv-python 4.13.0.90 depends on numpy>=2` — immediately. `4.11.0.86`
+  is the highest version pip resolves against `numpy==1.26.4`; the 197
+  tests above ran against that pin, not the original one.
+
+  Provider keys were not part of this: the "add keys" step in extracting a
+  document through the built containers is still blocked by the gap further
+  down this list — no field on `Settings` for a Gemini, OpenAI or DeepSeek
+  key — and packaging does not touch `app/config.py`. A real extraction
+  through the compose stack is therefore unproven for two independent
+  reasons, not one, and fixing Docker's absence on this machine would still
+  leave the other standing.
+
 Known gaps:
 
 - `app/config.py` is still Anthropic-shaped and `app/llm.py` is not. Config
@@ -1099,13 +1157,12 @@ Known gaps:
   1200x1500 in, 807x1105 out against an 800x1100 original, residual skew 0.0
   degrees, and a flat scan passing through at its own size. That script lives
   outside the repo; the checks belong in `tests/test_preprocess.py`.
-- **The repo has no dependency file at all.** There is no `requirements.txt`,
-  no `pyproject.toml`, nothing — and `api/main.py` has now added `fastapi`,
-  `uvicorn` and `python-multipart` to the list of things that have to be
-  installed by hand before anything runs. That was survivable while the repo
-  was a library; it is not survivable now that it has a server somebody else is
-  expected to start. One file, and the pins for the two SDK families and
-  psycopg belong in it too.
+- ~~The repo has no dependency file at all~~ **Resolved**: `requirements.txt`
+  and `requirements-ocr.txt` exist now, pinned to what this repo was actually
+  built and tested against — with one pin corrected by a clean-venv install
+  rather than trusted from this machine's `pip show` (see the packaging entry
+  above). Still open: nothing pins `pytest`, so the version the 197-test
+  suite runs against (`7.4.4` here) is undeclared anywhere in the repo.
 - The upload cap is `MAX_UPLOAD_MB = 25` in `api/main.py` and
   `settings.max_upload_mb` is 20, and the two are not connected. The task named
   25 and the limit a client is refused by has to be the documented one, so the
@@ -1156,6 +1213,16 @@ Known gaps:
   and that a deliberately wrong ground-truth field is the one `weakest_fields`
   names. None of that is a claim about which engine is better — it still needs
   labelled documents in `samples/` for that, and none exist on this machine.
+- `docker compose up --build` has never been run — there is no Docker on this
+  machine, natively or in its one WSL distribution (see the packaging entry
+  above for what was verified in its place). The untested surface is Docker
+  itself: the image build, the `depends_on: condition: service_healthy`
+  ordering across `postgres` → `api` → `ui`, and the named volume actually
+  persisting `postgres`'s data across a restart. Whoever runs this first on a
+  machine that has Docker should also add the provider-key fields to
+  `app/config.py` first — without them the same `LLMError: no API key`
+  every prior session hit is what a real extraction through the compose
+  stack will hit too.
 
 ## Conventions
 
