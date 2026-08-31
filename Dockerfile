@@ -9,7 +9,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# libgl1 + libglib2.0-0: opencv's runtime shared libraries (app/preprocess.py).
+# No libgl1/libglib2.0-0 here: requirements.txt pins opencv-python-headless,
+# not opencv-python, specifically to need neither -- the GUI build's system
+# dependencies were observed unresolvable on at least one real deployment
+# target (see the comment on that pin in requirements.txt).
 # tesseract-ocr + its ara/eng data: the traditional:tesseract engine: the
 # binary pytesseract shells out to, not a Python package.
 # poppler-utils: PyMuPDF's own PDF rendering does not depend on it, but it is
@@ -17,8 +20,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # it is a few MB next to the image's other costs.
 # curl: the container healthchecks in docker-compose.yml.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgl1 \
-        libglib2.0-0 \
         tesseract-ocr \
         tesseract-ocr-ara \
         tesseract-ocr-eng \

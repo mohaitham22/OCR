@@ -25,8 +25,14 @@ psycopg-pool==3.3.1
 tenacity==8.2.3
 
 # --- Preprocessing (app/preprocess.py): PDF triage, image ops ------------
+# Headless, not opencv-python: nothing here calls imshow/namedWindow/etc, and
+# the GUI build's libGL/libglib system dependencies have been observed to be
+# unresolvable on at least one real deployment target (Streamlit Community
+# Cloud's apt sources mix Debian bullseye and trixie, and bullseye's
+# libglib2.0-0 wants libffi7, which trixie no longer ships). Headless links
+# against none of that.
 numpy==1.26.4
-opencv-python==4.11.0.86
+opencv-python-headless==4.11.0.86
 pymupdf==1.27.2.2
 
 # --- Traditional engine, tesseract backend (app/engines/traditional.py) --
