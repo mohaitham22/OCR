@@ -5,12 +5,15 @@ has nowhere to put a separate `api/main.py` process. `ui/streamlit_app.py`
 stays the API-backed review UI for local and `docker-compose` use, unchanged;
 this file trades that two-service architecture for a single deployable page,
 in exchange for no persistence (`process(..., persist=False)`: nothing here
-can be saved or approved, since that needs Postgres) and one fixed engine.
+can be saved or approved, since that needs Postgres).
 
-The engine is pinned to `vlm:gemini` rather than offered as a choice: it is
-the only one of the four that needs neither an OCR binary
-(`traditional:tesseract`) nor a ~1 GB pip package
-(`traditional:paddle`) to run, which matters on a free-tier build.
+Engine choice is limited to the two `vlm:*` keys, not all four the registry
+knows: `traditional:tesseract` needs the `tesseract-ocr` apt package, and
+`packages.txt` has already broken this deployment's build twice on Streamlit
+Cloud's own apt sources -- see the Dockerfile and requirements.txt comments
+for that history. `traditional:paddle` is a ~1 GB pip install, unfit for a
+free-tier build regardless of platform. Both `vlm:*` engines need nothing but
+a provider API key.
 
 Run locally with:
 
@@ -34,10 +37,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import streamlit as st
 
 from app.config import settings
+from app.engines import available_engines
 from app.pipeline import process
 from app.schemas import DOC_TYPES, ProcessResult
 
-ENGINE_KEY = "vlm:gemini"
+_CLOUD_ENGINE_KEYS = ("vlm:gemini", "vlm:openai")
 _DOC_TYPE_ORDER = ["receipt", "invoice", "document"]
 _ACCEPTED_SUFFIXES = ["pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp"]
 
@@ -46,41 +50,78 @@ st.set_page_config(page_title="OCR DMS demo", layout="wide")
 
 def _md_safe(text: str | None) -> str | None:
     """See ui/streamlit_app.py's own copy: Streamlit's markdown parser drops
-    everything after a ':' immediately followed by a letter, which both an
-    engine key ("vlm:gemini") and an issue or error message can contain."""
+    everything after a ':' immediately followed by a letter, which an engine
+    key ("vlm:gemini"), an engine note, or an issue/error message can contain."""
     return text if text is None else text.replace(":", "\\:")
+
+
+def _cloud_engines() -> list[dict[str, str]]:
+    """The two vlm:* engines, described the way app.engines already describes
+    them -- reused rather than restated, so this file cannot drift from what
+    `available_engines()` says elsewhere in the app."""
+    return [
+        {"key": e.key, "label": e.label, "note": e.note}
+        for e in available_engines()
+        if e.key in _CLOUD_ENGINE_KEYS
+    ]
+
+
+_KEY_SETTING = {"vlm:gemini": "gemini_api_key", "vlm:openai": "openai_api_key"}
 
 
 st.title("OCR DMS -- extraction demo")
 st.caption(
-    "Reads a receipt, invoice, or document with Google Gemini and shows the "
-    "structured fields it extracted. Demo only: nothing uploaded here is saved."
+    "Reads a receipt, invoice, or document and shows the structured fields it "
+    "extracted. Demo only: nothing uploaded here is saved."
 )
 
-if not settings.gemini_api_key.strip():
+if not (settings.gemini_api_key.strip() or settings.openai_api_key.strip()):
     st.error(
-        "GEMINI_API_KEY is not set. On Streamlit Community Cloud: app menu -> "
-        "Settings -> Secrets, add `GEMINI_API_KEY = \"...\"`. Locally: add it "
-        "to .env. Then reload."
+        "No provider key is set. On Streamlit Community Cloud: app menu -> "
+        "Settings -> Secrets, add `GEMINI_API_KEY = \"...\"` or "
+        "`OPENAI_API_KEY = \"...\"`. Locally: add one to .env. Then reload."
     )
     st.stop()
 
 doc_types = [d for d in _DOC_TYPE_ORDER if d in DOC_TYPES]
+engines = _cloud_engines()
 
 with st.sidebar:
     st.header("Run")
     doc_type = st.selectbox("Document type", doc_types)
-    uploaded = st.file_uploader("Document", type=_ACCEPTED_SUFFIXES)
-    run = st.button("Run extraction", type="primary", disabled=uploaded is None)
 
-if run and uploaded is not None:
-    data = uploaded.getvalue()
-    with st.spinner("Reading the document with Gemini..."):
-        st.session_state.result = process(data, uploaded.name, doc_type, ENGINE_KEY, persist=False)
+    engine_key = st.radio(
+        "Engine",
+        [e["key"] for e in engines],
+        format_func=lambda k: next(e["label"] for e in engines if e["key"] == k),
+        captions=[_md_safe(e["note"]) for e in engines],
+    )
+    key_setting = _KEY_SETTING[engine_key]
+    if not getattr(settings, key_setting, "").strip():
+        st.caption(f"⚠️ {key_setting.upper()} is not set -- this engine will fail until it is.")
+
+    st.divider()
+    input_mode = st.radio("Input", ["Upload a file", "Use camera"], horizontal=True)
+    if input_mode == "Upload a file":
+        uploaded = st.file_uploader("Document", type=_ACCEPTED_SUFFIXES)
+        data = uploaded.getvalue() if uploaded is not None else None
+        filename = uploaded.name if uploaded is not None else None
+    else:
+        st.caption("Photographs work best flat, well lit, and square to the camera.")
+        photo = st.camera_input("Take a photo of the document")
+        data = photo.getvalue() if photo is not None else None
+        filename = "camera_capture.jpg"
+
+    run = st.button("Run extraction", type="primary", disabled=data is None)
+
+if run and data is not None:
+    engine_label = next(e["label"] for e in engines if e["key"] == engine_key)
+    with st.spinner(f"Reading the document with {engine_label}..."):
+        st.session_state.result = process(data, filename, doc_type, engine_key, persist=False)
 
 result: ProcessResult | None = st.session_state.get("result")
 if result is None:
-    st.info("Upload a document and press “Run extraction” to see results here.")
+    st.info("Upload a document or take a photo, then press “Run extraction” to see results here.")
 else:
     extraction = result.extraction
     cols = st.columns(4)
