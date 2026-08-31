@@ -132,11 +132,14 @@ Built:
     pass that removes nothing ends the loop rather than spinning; only then
     does the document come back as `None`.
 - `app/engines/traditional.py` — the OCR backend, in two deliberately separable
-  stages: a recogniser reads pixels into `TextBlock`s, then a text model maps
-  those onto the schema. The seam between them is a string plus boxes, and that
-  is what buys the review UI coordinates and per-line confidences and what lets
-  stage two be swapped for rules or LayoutLM later without a line of stage one
-  changing.
+  stages: a recogniser reads pixels into `TextBlock`s, then keyword and pattern
+  matching maps those onto the schema — no model call, no API key, no network,
+  as of the session that replaced the original text-model stage two (see the
+  update note at the end of this bullet for why). The seam between the two
+  stages is a string plus boxes, and that is what buys the review UI
+  coordinates and per-line confidences and what let stage two be swapped for
+  rules without a line of stage one changing, exactly as this file predicted
+  when it was still a text model.
   - `TraditionalExtractor(backend="paddle" | "tesseract")` sets `key` and
     `label` per instance — `traditional:paddle` and `traditional:tesseract` are
     two registry entries, because running one recogniser against the other is
@@ -181,10 +184,51 @@ Built:
     much as the line carrying the total — and it is `None` on the text-layer
     path, where no recogniser ran and 1.0 would be a claim about the extraction
     rather than about the transcription. Failure never leaves the engine: a
-    backend that will not load, a page with no text and a model call that
-    raises all come back as an `ExtractionResult` with `document=None`, keeping
-    whatever OCR text was already paid for. An unknown `doc_type` is the one
-    exception — that is a caller bug, and it raises before the clock starts.
+    backend that will not load, a page with no text and a structuring step
+    that raises all come back as an `ExtractionResult` with `document=None`,
+    keeping whatever OCR text was already paid for. An unknown `doc_type` is
+    the one exception — that is a caller bug, and it raises before the clock
+    starts.
+  - **Update, same repo, later session:** stage two was rewritten from a text
+    model (`llm.structured_text`) to `_structure`, pure keyword and regex
+    matching with no import of `app.llm` at all — at the user's explicit
+    request that "the traditional method works only with the library, not use
+    any API for any LLM," after the deployed Streamlit Cloud demo hit
+    Gemini's 20-request/day free-tier quota and `traditional:tesseract`
+    turned out to depend on that same quota for its text-structuring call.
+    Both `traditional:paddle` and `traditional:tesseract` share
+    `TraditionalExtractor`, so both lost the model-structuring stage, not
+    only the one exposed in the demo. `_structure` covers only what
+    `app.validate` actually requires plus a currency and a date —
+    `merchant_name`/`merchant_name_ar` (receipt) or `vendor_name`/
+    `vendor_name_ar` and `invoice_number` (invoice), `total`, `date` /
+    `issue_date`, `currency` — found by scanning `reading_order_text` for a
+    small set of English and Arabic labels (`_TOTAL_LABELS`,
+    `_INVOICE_NUMBER_LABELS`), reading a document's total from the bottom of
+    the page up and explicitly excluding lines that also read as a subtotal
+    (`"total"` is a substring of `"subtotal"`), and taking the first non-blank
+    line as the merchant/vendor name, routed to the Arabic or Latin field by
+    `_script`. `doc_type="document"` gets no heuristics at all — no reliable
+    keyword to anchor a title or issuer on — and returns `{"full_text":
+    source_text}`, a lossless copy rather than a guess. The result still goes
+    through `coerce_fields`, so a field the patterns get wrong is dropped and
+    warned about exactly as an invalid model answer would be, not a
+    validation error that loses the whole document. Line items, addresses and
+    every other field stay null, same as an unreadable field on the
+    model-based engines — the difference is *why* it is null, not the
+    contract around a null. Verified for real: 214 tests pass (up from 197,
+    17 new — the rule functions unit-tested directly, plus `extract`
+    end-to-end with the LLM stubbing removed from every test in
+    `tests/test_traditional.py`), and separately, with the process's own
+    `socket.connect` monkeypatched to raise on any call, a synthetic receipt
+    image rendered with PIL went through real Tesseract 5.5.2 and came back
+    with `merchant_name="Corner Bakery"` and `total=13.8` correctly read —
+    proof the whole path, OCR included, makes no network call, not just that
+    the code contains no `import app.llm`. `app/engines/__init__.py`'s
+    `_NOTES` for both traditional keys and its module docstring were updated
+    to stop claiming all four engines need an API key, and `ui/cloud_app.py`
+    no longer gates the whole demo behind a Gemini/OpenAI key being set —
+    only the two Vision LLM sidebar options do.
 - `app/engines/vlm.py` — the vision backend: one `structured_vision` call reads
   the pages and fills the schema, with no recogniser and no seam in the middle.
   - `VLMExtractor(provider="gemini" | "openai")` sets `key` and `label` per

@@ -14,9 +14,10 @@ request carries into an object, and this is it. Two rules keep it honest:
 
 `available_engines` exists for the UI, which has to offer this choice to
 somebody who did not write any of it. Its `note` is written for that person: it
-says what the engine is good and bad at, not what its class is called. All four
-make at least one model call and so all four need an API key -- the traditional
-pair to turn OCR text into fields, the vision pair to read the pages.
+says what the engine is good and bad at, not what its class is called. Only the
+vision pair makes a model call -- the traditional pair reads pixels with an OCR
+library and maps the result onto the schema with keyword and pattern matching,
+so neither traditional engine needs an API key or a network connection.
 """
 
 from __future__ import annotations
@@ -59,18 +60,21 @@ _BUILDERS: dict[str, Callable[[], Extractor]] = {
 
 _NOTES: dict[str, str] = {
     "traditional:paddle": (
-        "Reads the page with PaddleOCR, then asks a text model to fill in the fields. The "
-        "stronger of the two readers on Arabic and on mixed Arabic/English pages, and it "
-        "records where on the paper every line was found, so a reviewer can see which part "
-        "of the page a value was taken from. It wants a reasonably clean printed page; the "
-        "OCR models are a large one-off download and the first document after startup is slow."
+        "Reads the page with PaddleOCR, then maps a handful of fields onto the schema with "
+        "keyword and pattern matching -- no model call, no API key, no network. The stronger "
+        "of the two readers on Arabic and on mixed Arabic/English pages, and it records where "
+        "on the paper every line was found, so a reviewer can see which part of the page a "
+        "value was taken from. It wants a reasonably clean printed page and a document that "
+        "prints its total and its name where this engine expects to find them; the OCR models "
+        "are a large one-off download and the first document after startup is slow."
     ),
     "traditional:tesseract": (
-        "Reads the page with Tesseract, then asks a text model to fill in the fields. Quick "
-        "to install and quick to start, and it also records where each line sits on the page, "
+        "Reads the page with Tesseract, then maps a handful of fields onto the schema with "
+        "keyword and pattern matching -- no model call, no API key, no network. Quick to "
+        "install and quick to start, and it also records where each line sits on the page, "
         "but it is weaker than PaddleOCR on Arabic script and falls further behind on "
-        "photographs and faint print. A fair choice for clean English scans, and the second "
-        "opinion when PaddleOCR looks wrong."
+        "photographs and faint print. A fair choice for clean English scans, and the one "
+        "engine here that keeps working when every provider key is out of quota."
     ),
     "vlm:gemini": (
         "Sends the page images to Google Gemini, which reads the paper and fills in the "

@@ -11,14 +11,16 @@ Engine choice is limited to three of the four the registry knows:
 `traditional:paddle` is a ~1 GB pip install, unfit for a free-tier build on
 any platform, so it never appears here. The other three split into two
 methods, which the sidebar offers as its own top-level radio before either
-sub-choice: Vision LLM (`vlm:gemini` / `vlm:openai`, nothing but a provider
-key) and Traditional OCR (`traditional:tesseract`, the `tesseract-ocr` apt
-package via packages.txt plus a provider key for the text stage that turns
-the recognised words into fields). packages.txt has broken this deployment's
-build before on Streamlit Cloud's own apt sources -- see the Dockerfile and
-requirements.txt comments for that history -- but the earlier failure was
-specifically `libglib2.0-0`, dropped when opencv-python-headless replaced
-opencv-python; tesseract-ocr's own dependencies do not touch it.
+sub-choice: Vision LLM (`vlm:gemini` / `vlm:openai`, needs a provider key)
+and Traditional OCR (`traditional:tesseract`, the `tesseract-ocr` apt
+package via packages.txt and nothing else -- stage two is keyword and
+pattern matching in `app.engines.traditional`, not a model call, so this
+path needs no API key and keeps working when every provider is out of
+quota). packages.txt has broken this deployment's build before on Streamlit
+Cloud's own apt sources -- see the Dockerfile and requirements.txt comments
+for that history -- but the earlier failure was specifically
+`libglib2.0-0`, dropped when opencv-python-headless replaced opencv-python;
+tesseract-ocr's own dependencies do not touch it.
 
 Run locally with:
 
@@ -72,20 +74,20 @@ def _cloud_engines() -> dict[str, dict[str, str]]:
     return {e.key: {"label": e.label, "note": e.note} for e in available_engines() if e.key in offered}
 
 
-def _key_setting_for(engine_key: str) -> str:
-    """Which Settings field a missing-key warning should point at.
+def _key_setting_for(engine_key: str) -> str | None:
+    """Which Settings field a missing-key warning should point at, or None if the
+    engine needs no key at all.
 
-    vlm:* pins its own provider explicitly (VLMExtractor(provider=...)), so
-    the key is always the one matching its name. traditional:tesseract does
-    not: the OCR step needs no key, but the text step after it -- turning
-    recognised words into fields -- goes through whichever provider
-    settings.llm_provider names, same as app.llm._resolve would pick.
+    vlm:* pins its own provider explicitly (VLMExtractor(provider=...)), so the
+    key is always the one matching its name. traditional:tesseract needs
+    nothing: both its stages -- OCR, then keyword/pattern matching in
+    app.engines.traditional -- run locally.
     """
     if engine_key == "vlm:openai":
         return "openai_api_key"
-    if engine_key == "traditional:tesseract" and settings.llm_provider.strip().lower() == "openai":
-        return "openai_api_key"
-    return "gemini_api_key"
+    if engine_key == "vlm:gemini":
+        return "gemini_api_key"
+    return None
 
 
 st.title("OCR DMS -- extraction demo")
@@ -95,12 +97,12 @@ st.caption(
 )
 
 if not (settings.gemini_api_key.strip() or settings.openai_api_key.strip()):
-    st.error(
-        "No provider key is set. On Streamlit Community Cloud: app menu -> "
+    st.info(
+        "No provider key is set, so **Traditional OCR** is the only method that will "
+        "work right now (it needs no key). To also use **Vision LLM**: app menu -> "
         "Settings -> Secrets, add `GEMINI_API_KEY = \"...\"` or "
         "`OPENAI_API_KEY = \"...\"`. Locally: add one to .env. Then reload."
     )
-    st.stop()
 
 doc_types = [d for d in _DOC_TYPE_ORDER if d in DOC_TYPES]
 engines = _cloud_engines()
@@ -111,7 +113,8 @@ with st.sidebar:
 
     method = st.radio("Method", list(_METHOD_ENGINES), captions=[
         "Reads the page images directly, one model call.",
-        "Recognises text first (Tesseract), then a model fills in the fields.",
+        "Recognises text with Tesseract, then fills the fields by pattern "
+        "matching -- no API key needed.",
     ])
     method_keys = _METHOD_ENGINES[method]
     if len(method_keys) > 1:
@@ -126,7 +129,7 @@ with st.sidebar:
         st.caption(_md_safe(engines[engine_key]["note"]))
 
     key_setting = _key_setting_for(engine_key)
-    if not getattr(settings, key_setting, "").strip():
+    if key_setting is not None and not getattr(settings, key_setting, "").strip():
         st.caption(f"⚠️ {key_setting.upper()} is not set -- this engine will fail until it is.")
 
     st.divider()

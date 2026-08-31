@@ -19,13 +19,21 @@ from typing import Any
 import numpy as np
 import pytest
 
-from app import llm
 from app.engines import traditional
 from app.engines.traditional import (
     TraditionalExtractor,
+    _find_amount,
+    _find_currency,
+    _find_date,
+    _find_label_value,
+    _first_named_line,
     _overall_confidence,
     _paddle_lines,
+    _structure,
+    _SUBTOTAL_MARKERS,
     _tesseract_lines,
+    _TOTAL_LABELS,
+    _TOTAL_LABELS_LOOSE,
     reading_order_text,
 )
 from app.schemas import TextBlock
@@ -170,7 +178,10 @@ def test_an_unknown_backend_is_rejected_at_construction() -> None:
         TraditionalExtractor(backend="easyocr")
 
 
-# --- extract -------------------------------------------------------------
+# --- extract ---------------------------------------------------------------
+# Stage two is rule-based now: no model to stub, so these exercise `extract`
+# end to end -- recognised (or embedded) text in, a coerced document out --
+# and the rule-matching itself is pinned separately, below.
 
 
 @pytest.fixture
@@ -185,45 +196,24 @@ def engine(monkeypatch: pytest.MonkeyPatch) -> TraditionalExtractor:
     return extractor
 
 
-@pytest.fixture
-def captured(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    """Stub `app.llm.structured_text`, recording the prompt it was handed."""
-    seen: dict[str, Any] = {"calls": 0, "prompt": None, "system": None}
-
-    def fake(prompt: str, json_schema: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
-        seen["calls"] += 1
-        seen["prompt"] = prompt
-        seen["system"] = kwargs.get("system")
-        return {"merchant_name": "ACME", "total": "10.00"}
-
-    monkeypatch.setattr(llm, "structured_text", fake)
-    return seen
-
-
-def test_an_embedded_text_layer_skips_the_recogniser(
-    engine: TraditionalExtractor, captured: dict[str, Any]
-) -> None:
+def test_an_embedded_text_layer_skips_the_recogniser(engine: TraditionalExtractor) -> None:
     """`engine` fails the test if its recogniser runs, so this asserts by not failing."""
     result = engine.extract([page()], "receipt", embedded_text="  Bakery\nTOTAL 10.00  ")
 
     assert result.raw_text == "Bakery\nTOTAL 10.00"
     assert result.text_blocks == []
-    assert "Bakery\nTOTAL 10.00" in captured["prompt"]
     assert result.document is not None
-    assert result.document.merchant_name == "ACME"
+    assert result.document.merchant_name == "Bakery"
+    assert result.document.total == 10.0
 
 
-def test_the_text_layer_path_reports_no_ocr_confidence(
-    engine: TraditionalExtractor, captured: dict[str, Any]
-) -> None:
+def test_the_text_layer_path_reports_no_ocr_confidence(engine: TraditionalExtractor) -> None:
     result = engine.extract([page()], "receipt", embedded_text="TOTAL 10.00")
 
     assert result.confidence is None
 
 
-def test_a_blank_text_layer_falls_through_to_the_recogniser(
-    monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]
-) -> None:
+def test_a_blank_text_layer_falls_through_to_the_recogniser(monkeypatch: pytest.MonkeyPatch) -> None:
     extractor = TraditionalExtractor(backend="paddle")
     monkeypatch.setattr(extractor, "_recognise", lambda pages: [block("Kiosk", 0, 0, 50, 20)])
 
@@ -232,9 +222,7 @@ def test_a_blank_text_layer_falls_through_to_the_recogniser(
     assert result.raw_text == "Kiosk"
 
 
-def test_the_prompt_carries_reordered_ocr_not_detection_order(
-    monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]
-) -> None:
+def test_the_result_carries_reordered_ocr_not_detection_order(monkeypatch: pytest.MonkeyPatch) -> None:
     extractor = TraditionalExtractor(backend="tesseract")
     scrambled = [
         block("10.00", 300, 60, 350, 80, confidence=0.90),
@@ -246,30 +234,26 @@ def test_the_prompt_carries_reordered_ocr_not_detection_order(
     result = extractor.extract([page()], "receipt")
 
     assert result.raw_text == "Cafe\nTOTAL 10.00"
-    assert "Cafe\nTOTAL 10.00" in captured["prompt"]
     assert result.engine == "traditional:tesseract"
     assert result.text_blocks == scrambled
     assert result.page_count == 1
     assert result.duration_ms is not None
-    assert captured["system"] and "Transcribe" in captured["system"]
+    assert result.document is not None
+    assert result.document.merchant_name == "Cafe"
+    assert result.document.total == 10.0
 
 
-def test_a_page_with_no_text_never_reaches_the_model(
-    monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]
-) -> None:
+def test_a_page_with_no_text_returns_an_empty_result(monkeypatch: pytest.MonkeyPatch) -> None:
     extractor = TraditionalExtractor(backend="paddle")
     monkeypatch.setattr(extractor, "_recognise", lambda pages: [])
 
     result = extractor.extract([page()], "invoice")
 
-    assert captured["calls"] == 0
     assert result.document is None
     assert result.doc_type == "invoice"
 
 
-def test_a_recogniser_that_will_not_load_returns_an_empty_result(
-    monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]
-) -> None:
+def test_a_recogniser_that_will_not_load_returns_an_empty_result(monkeypatch: pytest.MonkeyPatch) -> None:
     """A missing paddleocr must not take a compare-mode run down with it."""
     extractor = TraditionalExtractor(backend="paddle")
 
@@ -282,17 +266,13 @@ def test_a_recogniser_that_will_not_load_returns_an_empty_result(
 
     assert result.document is None
     assert result.engine == "traditional:paddle"
-    assert captured["calls"] == 0
 
 
-def test_a_failing_model_call_keeps_the_ocr_text(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_failing_structuring_step_keeps_the_ocr_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never-raise holds even if the rule-matching itself blows up."""
     extractor = TraditionalExtractor(backend="paddle")
     monkeypatch.setattr(extractor, "_recognise", lambda pages: [block("Cafe", 0, 0, 50, 20)])
-
-    def explode(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise llm.LLMError("no API key for provider 'gemini'")
-
-    monkeypatch.setattr(llm, "structured_text", explode)
+    monkeypatch.setattr(traditional, "_structure", lambda *a, **k: (_ for _ in ()).throw(ValueError("boom")))
 
     result = extractor.extract([page()], "receipt")
 
@@ -303,7 +283,7 @@ def test_a_failing_model_call_keeps_the_ocr_text(monkeypatch: pytest.MonkeyPatch
 def test_an_unusable_answer_comes_back_as_an_empty_result(
     engine: TraditionalExtractor, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(llm, "structured_text", lambda *a, **k: ["not", "an", "object"])
+    monkeypatch.setattr(traditional, "_structure", lambda *a, **k: ["not", "an", "object"])
 
     result = engine.extract([page()], "receipt", embedded_text="TOTAL 10.00")
 
@@ -313,8 +293,9 @@ def test_an_unusable_answer_comes_back_as_an_empty_result(
 def test_one_bad_field_does_not_lose_the_document(
     engine: TraditionalExtractor, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """coerce_fields's prune-and-retry still applies to whatever _structure returns."""
     answer = {"merchant_name": "ACME", "total": "10.00", "items": [{"description": "Tea", "quantity": "two"}]}
-    monkeypatch.setattr(llm, "structured_text", lambda *a, **k: answer)
+    monkeypatch.setattr(traditional, "_structure", lambda *a, **k: answer)
 
     result = engine.extract([page()], "receipt", embedded_text="TOTAL 10.00")
 
@@ -327,6 +308,127 @@ def test_one_bad_field_does_not_lose_the_document(
 def test_an_unknown_doc_type_is_a_caller_bug_and_raises(engine: TraditionalExtractor) -> None:
     with pytest.raises(ValueError, match="unknown doc_type"):
         engine.extract([page()], "manifest", embedded_text="anything")
+
+
+# --- Rule-based structuring --------------------------------------------------
+
+
+def test_structure_reads_a_typical_receipt() -> None:
+    text = "\n".join(
+        [
+            "Corner Bakery",
+            "123 Main St",
+            "Bread          1  5.00",
+            "Milk           2  3.50",
+            "Subtotal          12.00",
+            "VAT 15%            1.80",
+            "Total             13.80",
+        ]
+    )
+
+    fields = _structure("receipt", text)
+
+    assert fields["merchant_name"] == "Corner Bakery"
+    assert fields["merchant_name_ar"] is None
+    assert fields["total"] == "13.80"
+
+
+def test_total_is_not_confused_with_subtotal() -> None:
+    text = "Shop\nSubtotal 100.00\nTotal 115.00"
+
+    assert _find_amount(text, _TOTAL_LABELS, _TOTAL_LABELS_LOOSE, _SUBTOTAL_MARKERS) == "115.00"
+
+
+def test_a_bare_total_label_still_matches_when_no_subtotal_is_printed() -> None:
+    text = "Shop\nItems 2\nTotal 42.00"
+
+    assert _find_amount(text, _TOTAL_LABELS, _TOTAL_LABELS_LOOSE, _SUBTOTAL_MARKERS) == "42.00"
+
+
+def test_no_matching_label_returns_no_amount() -> None:
+    text = "Shop\nItems 2\nThank you for visiting"
+
+    assert _find_amount(text, _TOTAL_LABELS, _TOTAL_LABELS_LOOSE, _SUBTOTAL_MARKERS) is None
+
+
+def test_arabic_first_line_goes_into_the_arabic_name_field() -> None:
+    latin, arabic = _first_named_line("مطعم الرياض\nTotal 20.00")
+
+    assert latin is None
+    assert arabic == "مطعم الرياض"
+
+
+def test_latin_first_line_goes_into_the_latin_name_field() -> None:
+    latin, arabic = _first_named_line("Riyadh Restaurant\nTotal 20.00")
+
+    assert latin == "Riyadh Restaurant"
+    assert arabic is None
+
+
+def test_blank_leading_lines_are_skipped_before_the_name() -> None:
+    latin, _ = _first_named_line("\n   \nActual Name\nTotal 1.00")
+
+    assert latin == "Actual Name"
+
+
+def test_invoice_number_is_read_from_its_label() -> None:
+    text = "Some Vendor\nInvoice No: INV-2024-00123\nTotal 500.00"
+
+    assert _find_label_value(text, ("invoice no", "invoice number")) == "INV-2024-00123"
+
+
+def test_label_with_no_line_returns_none() -> None:
+    assert _find_label_value("Vendor\nTotal 500.00", ("invoice no",)) is None
+
+
+def test_date_iso_is_read_directly() -> None:
+    assert _find_date("Issued 2024-04-03") == "2024-04-03"
+
+
+def test_date_dmy_is_read_day_first() -> None:
+    """Matches the model prompt's own rule: an ambiguous all-numeric date is day-month-year."""
+    assert _find_date("Date: 03/04/2024") == "2024-04-03"
+
+
+def test_an_impossible_date_is_not_returned() -> None:
+    assert _find_date("Ref 99/99/9999") is None
+
+
+def test_currency_code_is_recognised() -> None:
+    assert _find_currency("Total SAR 125.00") == "SAR"
+
+
+def test_currency_symbol_maps_to_its_iso_code() -> None:
+    assert _find_currency("Total $10.00") == "USD"
+
+
+def test_no_currency_present_returns_none() -> None:
+    assert _find_currency("Total 125.00") is None
+
+
+def test_structure_reads_a_typical_invoice() -> None:
+    text = "\n".join(
+        [
+            "Gulf Supplies LLC",
+            "Invoice No: INV-778",
+            "Issue Date: 2024-01-15",
+            "Subtotal 200.00",
+            "Total 230.00",
+        ]
+    )
+
+    fields = _structure("invoice", text)
+
+    assert fields["vendor_name"] == "Gulf Supplies LLC"
+    assert fields["invoice_number"] == "INV-778"
+    assert fields["issue_date"] == "2024-01-15"
+    assert fields["total"] == "230.00"
+
+
+def test_structure_keeps_the_full_transcript_for_generic_documents() -> None:
+    text = "A letter.\nSecond line."
+
+    assert _structure("document", text) == {"full_text": text}
 
 
 # --- Confidence ----------------------------------------------------------

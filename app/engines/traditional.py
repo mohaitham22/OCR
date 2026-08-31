@@ -1,21 +1,23 @@
-"""The traditional backend: a recogniser reads pixels, a text model reads the recogniser.
+"""The traditional backend: a recogniser reads pixels, rules read the recogniser.
 
 The two stages are deliberately separable. Stage one turns a page into
 `TextBlock`s -- text, a confidence and a box each -- and stage two turns those
 into a document. Keeping them apart buys two things a single call cannot: the
 review UI gets coordinates and per-line confidences to highlight with, and stage
-two can be swapped for rules, a fine-tuned model or LayoutLM without a line of
-stage one changing. The seam between them is a string plus boxes, not a private
-handshake.
+two can be swapped for a model or LayoutLM without a line of stage one changing.
+The seam between them is a string plus boxes, not a private handshake.
+
+Stage two is keyword and pattern matching, not a model call: this engine makes
+no network request and needs no API key, which is the whole point of calling it
+"traditional" rather than a second wrapper around a vision model wearing an OCR
+label. The trade is accuracy on anything that does not print the handful of
+English and Arabic labels stage two looks for in the place it expects them --
+`app.engines.vlm` exists for the documents that need it.
 
 Neither recogniser is imported at module level. `paddleocr` pulls in
 `paddlepaddle` and `pytesseract` needs a binary on PATH, and the app has to boot
 on a machine with neither, so each is imported inside the method that uses it
 and a missing one is a `RuntimeError` naming the command that fixes it.
-
-No extraction policy lives here. `SYSTEM_PROMPT` and `build_prompt` come from
-`app.engines.base` and are sent as they are, so this engine and the vision one
-are told the same rules about the same page.
 """
 
 from __future__ import annotations
@@ -25,15 +27,15 @@ import re
 import threading
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
+from datetime import date as date_type
 from typing import Any, ClassVar
 
 import cv2
 import numpy as np
 
-from app import llm
 from app.config import settings
-from app.engines.base import SYSTEM_PROMPT, Extractor, build_prompt, coerce_fields
-from app.schemas import ExtractionResult, TextBlock, json_schema_for, schema_for
+from app.engines.base import Extractor, coerce_fields
+from app.schemas import ExtractionResult, TextBlock, schema_for
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +148,200 @@ def _left(block: TextBlock) -> float:
     return float(box[0]) if box and len(box) >= 4 else 0.0
 
 
+# --- Rule-based structuring (stage two, no model call) --------------------
+# `_structure` is the whole of stage two: keyword and pattern matching over the
+# reading-order text, independent per field. It covers only the fields
+# `app.validate` actually requires plus a currency and a date, because that is
+# the line between "a genuinely useful offline fallback" and "a hand-rolled
+# document parser" -- line items, addresses and payment details stay null here
+# the same way an unreadable field stays null on the model-based path, just for
+# a different reason: nothing anchored a pattern on them, not that the page did
+# not carry them.
+
+_ARABIC_DIGIT_MAP = str.maketrans(
+    {
+        **{chr(0x0660 + i): str(i) for i in range(10)},
+        **{chr(0x06F0 + i): str(i) for i in range(10)},
+        "٫": ".",
+        "٬": "",
+    }
+)
+_AMOUNT_TOKEN = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+# Checked first, in order: an unambiguous "this is the document's total" label.
+_TOTAL_LABELS = (
+    "grand total",
+    "amount due",
+    "total due",
+    "balance due",
+    "الإجمالي",
+    "المبلغ الإجمالي",
+)
+# Checked only if nothing above matched, and only on a line that does not also
+# read as a subtotal -- "total" alone is a substring of "subtotal", so the bare
+# label has to be paired with an exclusion or it finds the wrong row.
+_TOTAL_LABELS_LOOSE = ("total", "المجموع")
+_SUBTOTAL_MARKERS = ("subtotal", "sub total", "sub-total", "المجموع الفرعي")
+
+_INVOICE_NUMBER_LABELS = (
+    "invoice no",
+    "invoice number",
+    "invoice #",
+    "inv no",
+    "inv#",
+    "فاتورة رقم",
+    "رقم الفاتورة",
+)
+
+_CURRENCY_CODE = re.compile(
+    r"\b(SAR|AED|EGP|USD|EUR|GBP|KWD|QAR|BHD|OMR|JOD|SDG|SYP|IQD|LYD|MAD|TND|DZD|LBP)\b"
+)
+_CURRENCY_SYMBOLS: dict[str, str] = {"$": "USD", "€": "EUR", "£": "GBP", "﷼": "SAR"}
+
+# Year-first is checked before day-first, since a 4-digit year on either side of
+# a separator is unambiguous where DD/MM/YYYY and MM/DD/YYYY are not. The
+# system prompt's own rule -- an ambiguous all-numeric date reads day-month-year
+# -- is what _DATE_DMY encodes for the fallback.
+_DATE_ISO = re.compile(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b")
+_DATE_DMY = re.compile(r"\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})\b")
+
+
+def _normalise_digits(text: str) -> str:
+    return text.translate(_ARABIC_DIGIT_MAP)
+
+
+def _amount_on_line(line: str) -> str | None:
+    matches = _AMOUNT_TOKEN.findall(_normalise_digits(line))
+    return matches[-1] if matches else None
+
+
+def _find_amount(
+    text: str,
+    exact_labels: Sequence[str],
+    loose_labels: Sequence[str] = (),
+    exclude: Sequence[str] = (),
+) -> str | None:
+    """The amount beside the most convincing label, read from the bottom up.
+
+    A grand total conventionally sits below its line items and its subtotal,
+    so the last matching line in the document is likelier to be the one that
+    means the whole document rather than one row of it.
+    """
+    lines = list(reversed(text.splitlines()))
+    for raw_line in lines:
+        folded = raw_line.casefold()
+        if any(label in folded for label in exact_labels):
+            amount = _amount_on_line(raw_line)
+            if amount:
+                return amount
+    for raw_line in lines:
+        folded = raw_line.casefold()
+        if any(marker in folded for marker in exclude):
+            continue
+        if any(label in folded for label in loose_labels):
+            amount = _amount_on_line(raw_line)
+            if amount:
+                return amount
+    return None
+
+
+def _find_label_value(text: str, labels: Sequence[str]) -> str | None:
+    """Whatever follows a label on its own line, after a colon, dash or run of spaces."""
+    for raw_line in text.splitlines():
+        folded = raw_line.casefold()
+        for label in labels:
+            index = folded.find(label)
+            if index == -1:
+                continue
+            remainder = raw_line[index + len(label) :].strip(" \t:#-–—.")
+            if remainder:
+                return remainder
+    return None
+
+
+def _valid_date(year: int, month: int, day: int) -> str | None:
+    try:
+        return date_type(year, month, day).isoformat()
+    except ValueError:
+        return None
+
+
+def _find_date(text: str) -> str | None:
+    normalised = _normalise_digits(text)
+    iso = _DATE_ISO.search(normalised)
+    if iso:
+        year, month, day = (int(part) for part in iso.groups())
+        found = _valid_date(year, month, day)
+        if found:
+            return found
+    dmy = _DATE_DMY.search(normalised)
+    if dmy:
+        day_s, month_s, year_s = dmy.groups()
+        year = int(year_s) if len(year_s) == 4 else 2000 + int(year_s) if int(year_s) < 70 else 1900 + int(year_s)
+        found = _valid_date(year, int(month_s), int(day_s))
+        if found:
+            return found
+    return None
+
+
+def _find_currency(text: str) -> str | None:
+    match = _CURRENCY_CODE.search(text.upper())
+    if match:
+        return match.group(1)
+    for symbol, code in _CURRENCY_SYMBOLS.items():
+        if symbol in text:
+            return code
+    return None
+
+
+def _first_named_line(text: str) -> tuple[str | None, str | None]:
+    """The first non-blank line, as (latin_name, arabic_name).
+
+    Receipts and invoices both put the issuing party's name at the top of the
+    page, well before any label a pattern could anchor on -- a shop or a
+    letterhead is printed, not labelled "merchant name:".
+    """
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        return (None, line) if _script(line) == "ar" else (line, None)
+    return None, None
+
+
+def _structure(doc_type: str, source_text: str) -> dict[str, Any]:
+    """Field values pulled from `source_text` by keyword and pattern matching alone.
+
+    No model call and no whole-document understanding: each field is found (or
+    not) independently. Good enough for the fields `app.validate` requires;
+    everything else is left null rather than guessed, same rule the model-based
+    engines are held to.
+    """
+    if doc_type == "receipt":
+        name, name_ar = _first_named_line(source_text)
+        return {
+            "merchant_name": name,
+            "merchant_name_ar": name_ar,
+            "date": _find_date(source_text),
+            "currency": _find_currency(source_text),
+            "total": _find_amount(source_text, _TOTAL_LABELS, _TOTAL_LABELS_LOOSE, _SUBTOTAL_MARKERS),
+        }
+    if doc_type == "invoice":
+        name, name_ar = _first_named_line(source_text)
+        return {
+            "invoice_number": _find_label_value(source_text, _INVOICE_NUMBER_LABELS),
+            "vendor_name": name,
+            "vendor_name_ar": name_ar,
+            "issue_date": _find_date(source_text),
+            "currency": _find_currency(source_text),
+            "total": _find_amount(source_text, _TOTAL_LABELS, _TOTAL_LABELS_LOOSE, _SUBTOTAL_MARKERS),
+        }
+    # "document": no required field and no reliable keyword to anchor a title or
+    # an issuer on, so the one thing worth returning is the transcription
+    # itself -- a lossless copy, not a guess.
+    return {"full_text": source_text}
+
+
 # --- The engine ----------------------------------------------------------
 
 
@@ -214,11 +410,7 @@ class TraditionalExtractor(Extractor):
                 return self._empty(doc_type, pages, elapsed(), blocks=blocks)
 
             try:
-                raw = llm.structured_text(
-                    build_prompt(doc_type, source_text),
-                    json_schema_for(doc_type),
-                    system=SYSTEM_PROMPT,
-                )
+                raw = _structure(doc_type, source_text)
             except Exception:
                 logger.exception("%s could not structure %s", self.key, doc_type)
                 return self._empty(doc_type, pages, elapsed(), blocks=blocks, raw_text=source_text)
