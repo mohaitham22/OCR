@@ -241,6 +241,51 @@ Built:
   `note` is the one thing that lives only here, and it is written for whoever
   has to pick: what the engine is good and bad at, never a restatement of its
   name.
+- `app/validate.py` — the arithmetic gate, and the one layer that can catch a
+  misread number. `validate(doc_type, fields) -> list[Issue]` takes the parsed
+  document or the mapping behind it, because the pipeline holds a model and a
+  correction coming back from the review UI is a dict; an unknown `doc_type`
+  raises through `schema_for`, since a caller bug must not come back as a clean
+  sheet.
+  - The reason the module is arithmetic and not confidence is written at the
+    top of it: a recogniser reporting 0.97 on a digit it read wrong is stating
+    how sure it is that those pixels are the glyph it chose, which is a claim
+    about ink and not about the number. A 3 read as an 8 comes back confident
+    and every field stays individually plausible; what it cannot survive is the
+    document checking itself.
+  - Three arithmetic rules. Line totals sum to `subtotal` and
+    `subtotal + charges − discount_total` equals `total`, both errors;
+    `quantity × unit_price − discount` against a line's own total, a warning,
+    because a line that rounds does not make the figure the document is filed
+    for wrong. `charges` is `tax_amount` plus `service_charge`, `tip` and
+    `shipping` — a tip printed on a receipt is part of what was paid, and
+    leaving it out would fire the rule on every correct receipt that carries
+    one. Tolerance is `settings.amount_tolerance`, absolute currency and not a
+    ratio: per-item tax and rounding put a correct document a cent or two out,
+    and no proportion makes that scale with the size of the bill.
+  - Every rule declines rather than guesses. Missing inputs run no rule at all,
+    because a null the extractor was right to return is not a failed
+    reconciliation, and `_line_total_sum` returns `None` if any one line total
+    is null: short by an unknown amount is not the same as disagreeing by a
+    known one, and reporting it would point the reviewer at the subtotal
+    instead of at the line `coerce_fields` already warned about.
+  - Dates must be `YYYY-MM-DD`, parse as a real day — the shape check alone
+    passes `2024-02-31` straight into a `DATE` column — and fall between 1990
+    and today. `due_date` and `service_period_end` are exempt from the future
+    half, since both are supposed to be ahead of today, and a day of slack
+    covers a till in a timezone ahead of ours. A date that would not parse is
+    not then also reported as an ordering fault. Currency is three uppercase
+    letters, a warning: the amounts are still right, we just cannot name the
+    unit. Required fields are the receipt's `merchant_name` and `total` and the
+    invoice's `invoice_number`, `vendor_name` and `total`, each satisfied by
+    its `_ar` spelling too.
+  - `decide_status(issues, ocr_confidence, warnings) -> bool` is the gate:
+    any issue of any severity, any pipeline warning, or a confidence below
+    `settings.review_confidence_threshold` routes to review. Conservative on
+    purpose, and the asymmetry is the argument: a wrong number reaching the
+    database silently is found months later by someone reconciling accounts,
+    with every downstream report already built on it; a reviewer glancing at a
+    document that was fine costs seconds.
 - `tests/test_preprocess.py` — both triage directions, the threshold boundary,
   the page cap, images and failure modes, on PDFs built in memory. Loading
   only; the correction half is not covered yet.
@@ -260,6 +305,19 @@ Built:
   confidence weighting, the three Paddle result shapes and the Tesseract
   word-to-line regrouping. `settings` is replaced wholesale where it is read,
   so a developer's real `.env` cannot decide an outcome.
+- `tests/test_validate.py` — 44 tests, no network and no database. The one the
+  module exists for comes first: a receipt whose merchant, date, currency,
+  three lines and subtotal are all individually plausible and whose total reads
+  130.00 on a 115.00 document. One `total_mismatch` error naming `+15.00`, and
+  `decide_status` sends it to review at confidence 0.99 — the case no score
+  catches. The corrected receipt then returns no issues and auto-approves at
+  the same confidence, and the same clean receipt at 0.42 still routes to
+  review. Around those: the tolerance boundary at 115.02 and 115.03, each rule
+  declining on missing inputs, the date exemptions, an Arabic-only merchant
+  name satisfying the requirement, a zero total counting as present, amounts
+  arriving as strings, and both non-document inputs. `settings` is replaced
+  wholesale, so the tolerance and the threshold under test are the documented
+  ones and not a developer's `.env`.
 
 Two decisions in the correction half came out of watching it fail, and should
 not be quietly reverted:
@@ -297,8 +355,20 @@ transcript on the Gemini path — and `raw_text` would come back `None` on the o
 engine that has no `text_blocks` to fall back on. Untested, like the rest of
 that module.
 
-Not written yet: `app/validate.py`, `app/db.py`, `app/pipeline.py`, `api/`,
-`ui/`, `sql/`, `eval.py`.
+A sixth, in `app/validate.py`, reads as an omission until you see what
+tightening it would do. `decide_status` treats `ocr_confidence=None` as *no
+score*, not as a low one: the vision engine reports `None` by design and the
+PDF text-layer path reports `None` because nothing was recognised there either,
+so failing a missing score would send every one of those to review on the
+strength of a number nobody claimed. `validate` declines the same way — a rule
+missing an input reports nothing — and the future-date rule exempts `due_date`
+and `service_period_end`, which are supposed to be ahead of today. The
+conservatism is in the gate, where one real issue of any severity is enough;
+spreading it into the rules would only produce findings the reviewer learns to
+scroll past. `tests/test_validate.py` pins all four.
+
+Not written yet: `app/db.py`, `app/pipeline.py`, `api/`, `ui/`, `sql/`,
+`eval.py`.
 
 Known gaps:
 
@@ -333,6 +403,28 @@ Known gaps:
   placeholder in both, which is at least not two answers, but it is still not
   the answer: a reviewer cannot see a log line. It matters most on the vision
   path, where a dropped field is the only signal there is.
+- Nothing calls `app/validate.py` yet. `app/pipeline.py` is what runs it, puts
+  its issues in `ProcessResult.issues` beside the engine's, and sets
+  `needs_review` from `decide_status`. Until then `decide_status`'s `warnings`
+  argument has no producer — it is there for the engine notes the pipeline will
+  have and takes any non-empty sequence, so what goes in it is decided when the
+  pipeline is written, alongside the `Issue` question above.
+- `validate` reads the printed line totals against the printed subtotal, and
+  `app/schemas.py` describes a line total as *after* its line discount and the
+  subtotal as *before* discounts. A document-level `discount_total` is handled
+  where it belongs, in the total rule, but a receipt that prints line totals
+  before their own line discounts will disagree by the sum of them. It has not
+  been seen on a real document yet; if it is, the fix is to add the line
+  discounts back before comparing, not to widen the tolerance.
+- The rules the task named are all that is there. No `tax_rate × subtotal`
+  against `tax_amount`, no `amount_paid − total` against `change_due`, no
+  `total − amount_paid` against `balance_due`, and currency is shape-checked
+  rather than looked up, so `ZZZ` passes. Each is a few lines and an `Issue`
+  code; none was in scope.
+- `_EARLIEST` (1990) and `_FUTURE_SLACK` (one day) are module constants in
+  `app/validate.py`, not settings, in the same way the page cap is a constant
+  in `load_document`. Both belong in `app/config.py` next to
+  `amount_tolerance`, which is already there and already read.
 - OpenAI and DeepSeek see the schema twice: `build_prompt` embeds the compact
   one and `app.llm._json_instruction` appends the full Pydantic one to the
   system message. Gemini sees the compact one in the prompt and the sanitised
