@@ -763,7 +763,152 @@ carries a provider key. The three database-backed routes are proven only at
 their 503 — there is no Postgres on this machine any more, the 16.2 cluster
 below having been a user-mode one that is gone.
 
-Not written yet: `ui/`, `eval.py`.
+- `ui/streamlit_app.py` — the review UI, and the first thing in the repo that
+  talks to `api/main.py` over HTTP instead of importing `app/` directly.
+  Sidebar: mode (Extract / Compare engines), document type, an engine picker —
+  a radio with each engine's `note` as a caption in Extract mode, a multiselect
+  in Compare mode — and toggles for image cleanup and saving; Compare mode
+  hides the save toggle rather than disabling it, since `app.pipeline.compare`
+  takes no `persist` argument at all. Extract results are a metrics row
+  (engine, pages, seconds, OCR confidence or "n/a", status), issues grouped by
+  severity, then four tabs: Review fields, Recognised text (the transcript
+  plus `text_blocks` sorted lowest-confidence-first when the engine gives any),
+  Pages, and Raw JSON. Compare mode is one column of metrics per engine, an
+  agreement score, then a table of only the fields the engines disagree on
+  with an expander for the rest.
+  - The one hard requirement was that the review form is built from
+    `schema_for(doc_type).model_fields`, never from the keys the response
+    happened to contain: a field the extractor never mentions and a field it
+    returned `null` for look identical once a JSON response has been reduced
+    to a dict, and only the schema knows the field exists at all to draw a box
+    for it. Widget type is read off each field's annotation rather than
+    hand-mapped per name — `float in typing.get_args(...)` for an `Amount` /
+    `Rate` / `Quantity` field, `int` for the one `int | None` field
+    (`GenericDocument.page_count`), everything else a `text_input`
+    (`text_area` for `full_text` and `summary`) — so a field added to
+    `app/schemas.py` later gets a box without this file changing. `items` gets
+    its own `st.data_editor`, columns and types read off `LineItem.model_fields`
+    the same way, seeded with one blank row when the document has none so
+    there is something to type into; a row left blank is dropped again on
+    submit.
+  - Pages are the one thing rendered locally rather than fetched: the API
+    returns no page images, so `app.pipeline.render_pages` runs again against
+    the uploaded bytes with the same `clean_images` switch, cached on
+    `(bytes, filename, clean_images)` so a rerun triggered by editing an
+    unrelated review field does not re-run the crop/deskew/lighting chain
+    against a tab nobody is looking at.
+  - `API_URL` is read with a bare `os.environ.get`, not through
+    `app.config.settings`, and that is deliberate rather than a lapse in the
+    "settings come from `app.config.settings`" convention: it is the address
+    of a *different process* this file talks to over HTTP, and `Settings` is
+    what the API reads to configure itself, not what this file would read to
+    find the API. Putting it in `app/config.py` would hand a frontend concern
+    to a module the backend boots with.
+  - `_md_safe` exists because of a real bug, not a defensive habit: Streamlit's
+    markdown renderer reads a colon immediately followed by a letter as the
+    start of a directive (`:red[...]`, an emoji shortcode) and silently drops
+    everything from the colon onward when nothing recognisable follows it.
+    Every engine key in this system is `family:backend` — `traditional:paddle`,
+    `vlm:gemini` — and rendering one through `st.subheader` came back as the
+    bare family name with the backend gone and no error anywhere. The same
+    parser reads `help=`, so `Receipt.time`'s own description, "Purchase time
+    as HH:MM", loses `:MM` the same way. A colon followed by whitespace or a
+    digit is never touched by it, which is why `st.error(f"...{API_URL}...")`
+    with a `host:port` string read correctly in testing and is easy to
+    mistake for the whole class of strings being safe. Escaping every colon
+    before a markdown-rendering call is a no-op where the colon was never at
+    risk and the fix everywhere it was, so do not "simplify" the escaping back
+    out for the call sites that happened not to fail in testing.
+  - What did **not** get built: a banner for `used_text_layer`. That field
+    already does not exist on `ExtractionResult` — see the known gap below —
+    the traditional engine knows whether it read the PDF's text layer and has
+    nowhere to put the fact, so it only logs it, and that is still true here.
+    `app/schemas.py` was outside this task's named files, so the fix stays
+    where the earlier note put it: a field on `ExtractionResult`, filled by
+    the engine that knows.
+  - The task's proof steps named a field, `merchant_tax_id`, that does not
+    exist on `Receipt`, `Invoice` or `GenericDocument` — the closest is
+    `Receipt.tax_number`. The proof below used that field rather than adding
+    the named one to `app/schemas.py`, which would have been a schema change
+    outside this task's file.
+
+  Proven for real, not by reading the code. No API key and no Postgres exist
+  on this machine (see above), so `app.llm.structured_text` was stubbed with a
+  fixed answer — `tax_number: null`, every other receipt field filled — the
+  same technique `tests/test_pipeline.py` already uses, run this time through
+  a real `uvicorn` process instead of a `TestClient`. A synthetic receipt PDF
+  with a genuine embedded text layer (422 characters, well past
+  `MIN_CHARS_PER_PAGE`) took the text-layer path, so no OCR backend was needed
+  either. Through the running Streamlit app in a real browser: `tax_number`
+  rendered as an empty, editable box beside the rest of the form, filled. A
+  temporary embedded Postgres (`pgserver`, torn down afterward and not added
+  to the repo) took `documents.status`; its bundled build carries no contrib
+  extensions, so the schema was applied by hand with `pg_trgm` and its index
+  stripped — a fresh instance of the same "index that silently does nothing"
+  problem `sql/schema.sql` already documents for a C-locale database, not a
+  new one. With a real `document_id`, Approve enabled; editing `tax_number`
+  and `merchant_address` and clicking it produced exactly two `corrections`
+  rows — `tax_number` from `null` to `300123456700003`, `merchant_address`
+  from `"King Fahd Road, Jeddah"` to `"King Fahd Road, Jeddah -- Corniche
+  Tower"` — and no others, which is `diff_fields` confirming that every
+  untouched field round-tripped through its widget, `Amount`/`Rate` fields
+  through `st.number_input`'s `float` included, without registering a false
+  change. Compare mode was run the same way across `traditional:paddle` and
+  `traditional:tesseract` — both take the text-layer path on this PDF, so
+  neither needed a recogniser installed — and came back `agreement: 1.0`
+  across all 34 fields, both engines having been handed the same stub.
+
+- `eval.py` — the field-level accuracy harness, and the thing meant to turn
+  "which engine is better" from an opinion into a number. `discover_samples`
+  pairs every document in the folder with a same-stem `.json` of human-checked
+  fields and skips, with a logged name, anything that has none; `evaluate`
+  runs each requested engine over each pair through `app.pipeline.process`
+  with `persist=False` — an eval run is not a record and must not write rows a
+  reviewer would later have to account for — and scores every field with
+  `app.db.flatten_fields`, the same dotted paths `app.validate` and the review
+  UI already use, so a row in the per-document CSV names the same cell a
+  correction or an `Issue` would.
+  - `normalise(value)` is what keeps the score honest: money rounds to two
+    places, text is case-folded with its whitespace collapsed, and a
+    numeric-looking string coerces to a number before comparison, so "12.50"
+    typed into a human's JSON and 12.5 out of a parsed `Amount` field agree,
+    and "Total  Mart" agrees with "total mart". Skip this and every engine's
+    score is dominated by formatting differences that say nothing about
+    whether the number on the page was actually read correctly.
+  - Accuracy is aggregated two ways. The headline number per engine is fields
+    correct over fields compared, summed across the whole folder. The "five
+    weakest fields" are aggregated by `_field_key`, which strips the digit
+    segments out of a dotted path first — `items.2.unit_price` on one receipt
+    and `items.7.unit_price` on another are the same *field*; the line index
+    is an accident of that one document's layout, not something the next
+    document shares, and comparing without stripping it would report a dozen
+    near-empty line-index "fields" instead of the one that is actually weak.
+  - The module docstring carries the field-accuracy-not-CER argument the task
+    named: an engine can be 98% correct character by character and still get
+    40% of totals wrong, because the characters it misreads cluster on digits
+    rather than spreading evenly across the page, and CER would credit it for
+    every letter it got right regardless.
+  - `main` refuses to run on a folder that is empty or has no labelled
+    documents rather than inventing ground truth or falling back to a
+    synthetic corpus, and says so with a nonzero exit. Under about 100
+    labelled documents it still runs, but says the run proves the harness
+    rather than either engine.
+
+  This repo has no `samples/` directory at all, which is the first thing
+  running the harness against it found: `python eval.py samples --doc-type
+  receipt` printed `samples does not exist` and exited 1 — exactly the
+  refusal the task asked for. **`eval.py` has not been run against real
+  documents, and this is not that proof.** What is proven, in a scratch
+  location outside the repo and not added to it: a synthetic receipt image
+  built the way `tests/test_pipeline.py` builds one, `app.llm.structured_vision`
+  stubbed with a fixed answer the same way, and a hand-written `.json` label
+  that matched every field except `total` (82.00 against the stubbed 82.80)
+  and respelled `merchant_name` in different case and spacing. `evaluate` came
+  back with `merchant_name` correct — `normalise` absorbing the respelling —
+  and exactly one wrong field, `total`, which is also what `weakest_fields`
+  named at 0% with n=1. That is the harness scoring what it was handed
+  correctly; it is not a statement about `vlm:gemini` or any other engine,
+  none of which has an API key to be judged with yet.
 
 Known gaps:
 
@@ -1002,6 +1147,15 @@ Known gaps:
   attributable only as far as the caller is honest. That is fine for a local
   deployment and is not fine for a shared one; whatever answers it has to
   answer for `ui/` too, so it belongs above both.
+- `eval.py` has no test in `tests/` and no `samples/` folder to run against.
+  Everything worth pinning is reachable with `app.llm.structured_vision`
+  stubbed and no network, the same technique `tests/test_pipeline.py` already
+  uses: `normalise` on money, case and numeric strings; `_field_key` collapsing
+  line indices; `discover_samples` skipping an unlabelled document rather than
+  inventing one; the empty-and-unlabelled-folder refusal and its exit code;
+  and that a deliberately wrong ground-truth field is the one `weakest_fields`
+  names. None of that is a claim about which engine is better — it still needs
+  labelled documents in `samples/` for that, and none exist on this machine.
 
 ## Conventions
 
