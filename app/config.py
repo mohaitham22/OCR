@@ -28,9 +28,25 @@ class Settings(BaseSettings):
     )
 
     # --- Model access ----------------------------------------------------
-    anthropic_api_key: str = Field(default="", description="Empty disables both LLM paths.")
-    llm_model: str = Field(default="claude-opus-5", description="Text model for app.llm.structured_text.")
-    vision_model: str = Field(default="claude-opus-5", description="Vision model for app.llm.structured_vision.")
+    # app.llm.PROVIDERS keys on these exact names via getattr, so adding a
+    # field here is what turns a key in the environment into one it can see --
+    # nothing in app.llm changes. anthropic_api_key stays: no PROVIDERS entry
+    # reads it, but a field nobody reads is not the same bug as a key that
+    # goes missing because Settings' extra="ignore" silently dropped it.
+    anthropic_api_key: str = Field(default="", description="Unused: no provider in app.llm reads this.")
+    gemini_api_key: str = Field(default="", description="Key for provider 'gemini' (Google Gemini).")
+    openai_api_key: str = Field(default="", description="Key for provider 'openai' (OpenAI GPT).")
+    deepseek_api_key: str = Field(default="", description="Key for provider 'deepseek'. Text only, no vision model.")
+    llm_api_key: str = Field(
+        default="",
+        description="Shared fallback key, tried when the selected provider's own field is empty.",
+    )
+    llm_provider: str = Field(
+        default="gemini",
+        description="Provider used when a call does not name one: gemini | openai | deepseek.",
+    )
+    llm_model: str = Field(default="", description="Text model override. Empty uses the provider's own default.")
+    vision_model: str = Field(default="", description="Vision model override. Empty uses the provider's own default.")
     llm_max_tokens: int = 8192
     llm_timeout_seconds: float = 120.0
     llm_max_retries: int = Field(default=3, description="Retries on a schema-invalid response.")
@@ -92,7 +108,12 @@ class Settings(BaseSettings):
 
     @property
     def llm_enabled(self) -> bool:
-        return bool(self.anthropic_api_key.strip())
+        return bool(
+            self.gemini_api_key.strip()
+            or self.openai_api_key.strip()
+            or self.deepseek_api_key.strip()
+            or self.llm_api_key.strip()
+        )
 
 
 settings = Settings()
