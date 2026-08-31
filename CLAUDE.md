@@ -319,6 +319,168 @@ Built:
   wholesale, so the tolerance and the threshold under test are the documented
   ones and not a developer's `.env`.
 
+- `sql/schema.sql` — `documents`, `corrections`, and the two decisions in here
+  that cannot be added later.
+  - `documents` carries both `fields` and `raw_extraction`, and the split is
+    the point. `fields` is what the business queries and what
+    `approve_document` replaces, so it always holds the corrected truth.
+    `raw_extraction` is the whole `ExtractionResult` the engine returned,
+    written once on insert and updated by nothing — not an approval, not a
+    correction, not a migration. The argument is in the SQL: this schema will
+    change, and re-deriving the new shape from stored raw output is one
+    `UPDATE` that costs nothing, while re-running inference over the archive
+    costs the archive again and assumes the original uploads still exist. Raw
+    output that was never written down cannot be recovered afterwards at any
+    price, which is why it is not a "when we need it".
+  - `corrections` is one row per field a reviewer changed — dotted path, old
+    value, new value — and its reason is in the SQL too. It is the eval set and
+    later the fine-tuning set, and it is produced for free by work somebody is
+    doing anyway. It cannot be reconstructed after the fact: the instant
+    `documents.fields` is overwritten, nothing anywhere records that a human
+    looked at *that* field and disagreed. `raw_extraction` still holds the old
+    answer, but it holds the old answer for every field, including the ones the
+    reviewer read and accepted, and the difference between those two sets is
+    the entire label.
+  - `doc_type`, `engine` and `model` are copied onto each correction rather
+    than joined from the document. Re-process a document with another engine
+    and `documents.engine` names the backend behind the *current* fields, not
+    the one whose answer this reviewer rejected; per-engine accuracy is the
+    first question anyone asks of this table, and the join would answer it
+    wrongly and silently.
+  - The foreign key is `ON DELETE RESTRICT`. A correction is only interpretable
+    beside the page it came from, so deleting a document really does destroy
+    the pair — which is the argument for making that deletion a statement
+    somebody has to write, rather than a side effect of tidying up `documents`.
+    `CHECK (old_value IS DISTINCT FROM new_value)` refuses a row that records
+    no change, because a correction that corrected nothing enters the eval set
+    as a page the engine got wrong.
+  - `old_value` and `new_value` are `jsonb` and not `text`, so `12.5` and
+    `"12.50"` stay distinguishable: a training pair that cannot tell a number
+    from its printed spelling is not much of a training pair.
+  - Indexes. `(status, created_at DESC)` is the review queue and
+    `(doc_type, created_at DESC)` the browse list, both carrying the order the
+    rows are wanted in so neither listing sorts. `content_hash` is not unique —
+    the same page legitimately arrives twice, re-scanned or re-filed, and
+    refusing the insert would lose the second filing rather than flag it. GIN
+    `jsonb_path_ops` on `fields` indexes one hash per path-and-value instead of
+    an entry per key and per value, several times smaller and faster on `@>`,
+    and gives up only the key-existence operators this table cannot use anyway:
+    every extracted field is optional and therefore present-as-null, so "does
+    this document have a merchant_name" is a question about the value. GIN
+    `gin_trgm_ops` on `raw_text`, below. Two on `corrections`: `(document_id)`
+    for the review UI and for the FK's own lookup on delete, and
+    `(engine, field_path)` for the eval query.
+  - Trigram and not tsvector, with the reason on the index. Postgres ships no
+    Arabic text search configuration — no stemmer, no stop words, no lexeme
+    normalisation — so `to_tsvector('simple', raw_text)` would index
+    whitespace-delimited tokens verbatim, and Arabic writes the article, the
+    conjunctions and the attached pronouns joined to the word: one noun becomes
+    several different tokens and a search for one of them matches none of the
+    others. Trigrams do not know what language they are looking at, which is
+    the point, and they survive OCR — a word with one character misread keeps
+    most of its trigrams, where token equality misses the row outright. What
+    they buy is fuzzy substring matching and only that: no ranking, no phrase
+    search, no field weighting. So that index is the line. If Arabic search
+    ever has to be a feature rather than a convenience — ranked results,
+    morphological matching, snippets — the answer is OpenSearch with an Arabic
+    analyser beside Postgres, not a cleverer index here; Postgres cannot be
+    taken there and pretending it can costs a migration to find out.
+  - `comparison` and `agreement` are stored for the same reason
+    `raw_extraction` is: two engines disagreeing on a page is the cheapest
+    signal this system produces about which to trust, and it is produced once,
+    at the moment both were run.
+- `app/db.py` — Postgres, and the only place SQL is written. `enabled`,
+  `get_pool`, `close_pool`, `init_schema`, `save_document`, `list_documents`,
+  `get_document`, `approve_document`.
+  - With `settings.database_url` empty every one of them returns its empty
+    answer — None, `[]`, False — immediately, without importing a driver,
+    opening a socket or raising. That is the hard constraint, and
+    `tests/test_db.py` checks it by making any `import psycopg*` raise for the
+    duration of a test and then calling every entry point that could want one,
+    rather than by reading the code and agreeing with it.
+  - An empty URL is the only thing that gets that treatment. A URL that *is*
+    set and does not work — no driver installed, host unreachable, credentials
+    wrong — raises, because a database somebody configured and expects to be
+    written to is a different situation from one that was never configured, and
+    answering both with a quiet None makes the first indistinguishable from the
+    second until somebody goes looking for a month of documents that were never
+    stored. A missing driver names the pip command, the way the missing
+    recognisers in `traditional.py` name theirs.
+  - psycopg is imported inside the functions that use it, so the app boots
+    without it, and the pool is cached behind a lock for the reason the Paddle
+    readers are: two web threads arriving together must not each open
+    `db_pool_min` connections and throw one set away. Rows come back as dicts,
+    because everything above this module is JSON-shaped.
+  - `approve_document` is the one that matters. It flattens the stored and the
+    corrected fields to dotted paths, diffs them, inserts one `corrections` row
+    per changed value, and only then overwrites `documents.fields` — all in one
+    transaction, with the row taken `FOR UPDATE`. Both properties are
+    load-bearing. The UPDATE destroys the only thing that says which fields a
+    human disagreed with, so a commit that landed it without the corrections
+    rows would silently cost a training pair; and two reviewers on one document
+    would otherwise both diff against the pre-review values, with the second
+    UPDATE discarding the first one's edits. A reviewer who changed nothing
+    still approves — that is a judgement about the document — and simply writes
+    no rows.
+  - `flatten_fields` spells its paths the way `app.validate` spells
+    `Issue.field` — `total`, `items.2.unit_price` — so a correction and the
+    rule that flagged it name the same cell and the review UI can put them side
+    by side without translating between two path languages. An empty list or
+    dict is a leaf: a reviewer who deletes every line leaves no `items.N.*`
+    paths behind, and without `items: []` the diff would record only
+    disappearances, which read the same as a document that never had lines. The
+    document itself is the exception — an empty one has no fields, not one
+    field named `""`.
+  - `diff_fields` refuses to invent a change, and that is not fussiness. A row
+    recording a difference nobody made enters the eval set as a page the engine
+    got wrong and the fine-tuning set as the answer it should have given
+    instead. So a missing key and an explicit null are one statement, which is
+    what every optional field returns when the document does not show it; a
+    blank box is that same statement typed into a form, and is *recorded* as
+    null rather than as `""`, so the training pair does not ask the extractor
+    for a value it is forbidden to produce; and `12` and `12.0` are one number
+    that went through JSON. `True` and `1` are not, which is why the bool test
+    comes before the numeric one. Ordering is numeric per path segment, so
+    `items.2` sorts before `items.10` and a parent before its children.
+  - `list_documents` returns everything except `raw_extraction`, `comparison`
+    and `raw_text` — the three columns that make a row worth keeping are the
+    three that would not fit down the wire a page at a time — and filters on
+    `status` and `doc_type`, which are exactly the two composite indexes.
+    `get_document` returns those columns plus that document's corrections,
+    because it is the call the review UI makes when somebody opens a page and
+    the transcription is what they check the fields against.
+  - `init_schema` runs the file whole on every boot, every statement being
+    `IF NOT EXISTS`, and then checks one thing at runtime — see the seventh
+    decision below.
+- `tests/test_db.py` — 35 tests, no database and no driver. The flatten/diff
+  pair carries most of them, because both of its failure modes cost something
+  real and neither is visible: a change it misses is a label thrown away at the
+  moment it was created, and a change it invents is a correct page entered into
+  the eval set as a wrong one. So: the 130.00 receipt from
+  `tests/test_validate.py` corrected to 115.00 producing exactly one
+  `FieldChange`, a correction inside a line item arriving as
+  `items.1.unit_price`, a line added and every line deleted, the
+  same-value pairs that must produce nothing and the boolean that must not join
+  them, a cleared box recorded as null, and `items.2` before `items.10`. Then
+  the no-op contract for every entry point, one test of which makes any
+  `import psycopg*` an `AssertionError` before calling them. `settings` is replaced
+  wholesale, so a developer's real `.env` cannot decide an outcome.
+
+`sql/schema.sql` and `app/db.py` were run against a real PostgreSQL 16.2 —
+there is no Docker on this machine, so a user-mode cluster on port 55432 rather
+than the container in the task — and all 41 checks pass. `init_schema` twice
+for idempotency; `\d documents` and `\d corrections` rendered from the same
+catalogs psql reads, since this build ships no `psql.exe`; then the receipt
+`tests/test_validate.py` is built around, stored with its 130.00 misread and
+approved down to 115.00, producing exactly one `corrections` row naming
+`total`, `130.0`, `115.0` and `traditional:paddle`. Also pinned in that run:
+`raw_extraction` byte-identical after two separate approvals, a blank box
+writing no row, a second review arriving as `items.1.unit_price`, all three
+`CHECK`s and the `RESTRICT` refusing what their comments say they refuse,
+`EXPLAIN` choosing each of the six indexes by name, and Arabic matching through
+the trigram index. That script lives outside the repo; the checks belong in
+`tests/`, behind a skip when `DATABASE_URL` is unset.
+
 Two decisions in the correction half came out of watching it fail, and should
 not be quietly reverted:
 
@@ -367,8 +529,22 @@ conservatism is in the gate, where one real issue of any severity is enough;
 spreading it into the rules would only produce findings the reviewer learns to
 scroll past. `tests/test_validate.py` pins all four.
 
-Not written yet: `app/db.py`, `app/pipeline.py`, `api/`, `ui/`, `sql/`,
-`eval.py`.
+A seventh, in `sql/schema.sql`, is the one that would otherwise have shipped
+broken and stayed broken. `pg_trgm` asks the *database's* `LC_CTYPE` what counts
+as a letter, and under `LC_CTYPE=C` nothing outside ASCII is one, so every
+Arabic character is discarded before the trigrams are cut. Measured on 16.2 on
+one Arabic word: `show_trgm` returns 0 trigrams and `word_similarity` 0.0 under
+C, and 7 trigrams and 1.0 under `en-US`. A C-locale database therefore creates
+`documents_raw_text_trgm_idx`, keeps it up to date, and matches no Arabic in it
+ever — no error, no empty-index warning, just a query returning nothing and a
+corpus that looks as though it contains no Arabic. It cannot be repaired in
+SQL, because `LC_CTYPE` is fixed at `CREATE DATABASE`, so `init_schema` reads
+`datctype` after applying the file and logs a WARNING naming it. The
+measurement is in the comment on that index; the collation does not matter and
+the character classification is the whole thing, so do not "simplify" the
+warning away on the grounds that the index obviously works.
+
+Not written yet: `app/pipeline.py`, `api/`, `ui/`, `eval.py`.
 
 Known gaps:
 
@@ -392,7 +568,7 @@ Known gaps:
 - The repo carries no pytest configuration, so pytest resolves its rootdir from
   ancestor directories. On the current machine it finds `C:\Users\mooda\setup.cfg`
   and aborts before collection with a `UnicodeDecodeError`, so plain `pytest -q`
-  does not run at all; `pytest -c <any empty ini> --rootdir=. tests` passes 85
+  does not run at all; `pytest -c <any empty ini> --rootdir=. tests` passes 164
   tests. A `pytest.ini` at the repo root fixes it.
 - `coerce_fields` returns `(document, list[Issue])` and `ExtractionResult` has
   nowhere to put the issues, so an engine can only log them. `ProcessResult`
@@ -409,6 +585,42 @@ Known gaps:
   argument has no producer — it is there for the engine notes the pipeline will
   have and takes any non-empty sequence, so what goes in it is decided when the
   pipeline is written, alongside the `Issue` question above.
+  `app/db.py` is already waiting for it: `save_document` writes
+  `ProcessResult.issues` into the `issues` column and sets `status` from
+  `needs_review`, so the pipeline has only to fill the result it already
+  builds.
+- `app/db.py` has no test that touches Postgres. The 41 checks that prove the
+  schema live in a script outside the repo, which means they will rot: nothing
+  runs them, and the next change to `sql/schema.sql` or to `approve_document`
+  passes `pytest` whatever it does to the database. They belong in
+  `tests/test_db.py` behind a skip when `DATABASE_URL` is unset, which is also
+  the shape the missing recogniser tests want.
+- `save_document` takes `content_hash` as a keyword and computes nothing. The
+  bytes it would hash are read by whoever handled the upload, which is
+  `api/main.py` or `app/pipeline.py`, so until one of them exists the column is
+  null on every row and `documents_content_hash_idx` indexes nothing. Duplicate
+  detection is the feature that is not there yet, not the index.
+- The `rejected` status has no producer. The `CHECK` admits it and
+  `list_documents(status="rejected")` would return it, but nothing writes it: a
+  reviewer can approve a document or leave it, and "this page is not what it
+  says it is" has nowhere to go. `reject_document` is a few lines and belongs
+  beside `approve_document`, with the same question about whether a rejection
+  should write `corrections` rows — it probably should not, since a rejected
+  page is not a page whose fields are wrong.
+- `updated_at` is set by the statements that write it rather than by a trigger,
+  so a hand-written `UPDATE` in psql will leave it stale. A `BEFORE UPDATE`
+  trigger is five lines and makes the column mean what its name says.
+- `init_schema` is create-if-absent, not a migration tool. It adds a table or
+  an index that is not there; it will not alter a column, backfill one, or
+  notice that the file has changed under a database that already ran it. The
+  first schema change that is not purely additive needs Alembic or a hand-rolled
+  version table, and the argument for `raw_extraction` is the argument for
+  making that change cheap when it comes.
+- Neither pool timeouts nor a statement timeout are configurable.
+  `settings.db_pool_min` and `db_pool_max` are read; a query that hangs holds
+  its connection until the server drops it, and `pool.connection()` waits on
+  psycopg's default rather than on anything this app chose. Both belong in
+  `app/config.py` beside them.
 - `validate` reads the printed line totals against the printed subtotal, and
   `app/schemas.py` describes a line total as *after* its line discount and the
   subtotal as *before* discounts. A document-level `discount_total` is handled
