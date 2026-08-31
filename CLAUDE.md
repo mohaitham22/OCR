@@ -185,6 +185,62 @@ Built:
     raises all come back as an `ExtractionResult` with `document=None`, keeping
     whatever OCR text was already paid for. An unknown `doc_type` is the one
     exception — that is a caller bug, and it raises before the clock starts.
+- `app/engines/vlm.py` — the vision backend: one `structured_vision` call reads
+  the pages and fills the schema, with no recogniser and no seam in the middle.
+  - `VLMExtractor(provider="gemini" | "openai")` sets `key` and `label` per
+    instance, so `vlm:gemini` and `vlm:openai` are two registry entries for the
+    same reason the two recognisers are: asking both and comparing is the point
+    of having both. `PROVIDERS` is the vision-capable subset of
+    `app.llm.PROVIDERS` — DeepSeek serves no vision model, and `llm` refuses it
+    by name anyway. `gives_boxes = False`.
+  - What the path gives up is stated, not papered over: `text_blocks=[]` and
+    `confidence=None`, both with the comment saying `app.validate` is what
+    compensates. There is nothing in a vision answer that says where on the page
+    a value was read, and a fabricated 0.95 is a claim the review gate would act
+    on. Determinism goes too — temperature is 0 and the same page can still come
+    back different.
+  - `VISION_SYSTEM_PROMPT` is `SYSTEM_PROMPT` plus a page-condition addendum,
+    and the split is the point: the base prompt is *policy*, which both engines
+    must share, and the addendum is *condition* — skew, glare, creases, cropped
+    edges, a hand in frame — which only the model looking at pixels can use. The
+    traditional engine's model reads a transcription and is warned about that
+    instead, by `build_prompt`'s OCR framing. Neither warning helps the other.
+    The addendum's rule is that an unreadable character nulls the whole field:
+    no rebuilding around the gap, no recovering a digit from its column, no
+    finishing a word from its first half.
+  - `_transcript` is one extra top-level key holding the model's own plain-text
+    reading of every page. It is declared in the schema by
+    `_schema_with_transcript`, not merely requested in prose, because Gemini is
+    handed that schema as `response_schema` and answers with the keys it names
+    and no others. `_pop_transcript` removes it before `coerce_fields` and it
+    becomes `raw_text` — a few hundred tokens that give the reviewer something
+    to check the fields against, and the one place in the answer where a partly
+    legible line still belongs while the field it would have filled stays null.
+  - `embedded_text` is ignored, with the reason on it: reading a PDF's text
+    layer instead of its pixels would make this a text engine wearing a vision
+    engine's key, and compare mode would then be running two text extractions
+    against each other. Preferring the text layer is already the traditional
+    engine's answer. Failure never leaves the engine either — no pages, an
+    encode failure and a model call that raises all come back as an
+    `ExtractionResult` with `document=None`; an unknown `doc_type` raises before
+    the clock starts, as on the other engine.
+- `app/engines/__init__.py` — the registry, and the only place an engine module
+  is imported. Four keys, each mapped to a builder that does its import inside
+  itself, so importing `app.engines` costs nothing and a machine without
+  PaddleOCR can still list, choose and run the other three. `get_engine(key)`
+  returns a fresh instance and raises `ValueError` listing the valid keys rather
+  than falling back to a default — a request that named an engine and quietly
+  got another produces a result nobody can account for later. A bare
+  `traditional` or `vlm` resolves to whichever family member this deployment is
+  configured for, which is what keeps `settings.default_engine="traditional"`
+  meaning something; the lookup stays in the engine, which already reads
+  `settings.ocr_backend` and the configured provider, rather than being repeated
+  here. `available_engines()` returns `EngineInfo` (key, label, family,
+  `gives_boxes`, note) for the UI, reading `label` and `gives_boxes` off the
+  built engine so the list shown and the engine then run cannot drift apart. The
+  `note` is the one thing that lives only here, and it is written for whoever
+  has to pick: what the engine is good and bad at, never a restatement of its
+  name.
 - `tests/test_preprocess.py` — both triage directions, the threshold boundary,
   the page cap, images and failure modes, on PDFs built in memory. Loading
   only; the correction half is not covered yet.
@@ -233,9 +289,16 @@ is the boxes, and reversing them by script breaks every mixed row — the Arabic
 label and the Latin amount trade places, and a run of one script inside a line
 of the other lands at the wrong end. `tests/test_traditional.py` pins it.
 
-Not written yet: `app/validate.py`, `app/db.py`, `app/pipeline.py`,
-`app/engines/vlm.py`, the `app/engines/__init__.py` registry, `api/`, `ui/`,
-`sql/`, `eval.py`.
+A fifth, in `app/engines/vlm.py`, is easy to tidy away: `_transcript` is added
+to the *schema* sent to the provider, not only asked for in the prompt. Gemini
+is handed that schema as `response_schema` and answers with the keys it names
+and no others, so moving the request into prose alone would silently lose the
+transcript on the Gemini path — and `raw_text` would come back `None` on the one
+engine that has no `text_blocks` to fall back on. Untested, like the rest of
+that module.
+
+Not written yet: `app/validate.py`, `app/db.py`, `app/pipeline.py`, `api/`,
+`ui/`, `sql/`, `eval.py`.
 
 Known gaps:
 
@@ -265,10 +328,11 @@ Known gaps:
   nowhere to put the issues, so an engine can only log them. `ProcessResult`
   has the `issues` list they belong in, which means either `app/pipeline.py`
   collects them from the engine somehow or `ExtractionResult` grows a field.
-  Decide it when `app/pipeline.py` is written, before both engines have
-  invented their own answer. The `Issue` shape is already right for either.
-  `app/engines/traditional.py` logs them at WARNING in the meantime, which is a
-  placeholder and not the answer: a reviewer cannot see a log line.
+  Decide it when `app/pipeline.py` is written. The `Issue` shape is already
+  right for either. Both engines log them at WARNING in the meantime — the same
+  placeholder in both, which is at least not two answers, but it is still not
+  the answer: a reviewer cannot see a log line. It matters most on the vision
+  path, where a dropped field is the only signal there is.
 - OpenAI and DeepSeek see the schema twice: `build_prompt` embeds the compact
   one and `app.llm._json_instruction` appends the full Pydantic one to the
   system message. Gemini sees the compact one in the prompt and the sanitised
@@ -289,12 +353,34 @@ Known gaps:
   this task's scope, so for now the engine only logs it. Add the field, or have
   `app/pipeline.py` carry the flag; decide it with the `Issue` question above,
   since both are the same missing channel between an engine and its result.
-- `ExtractionResult.model` comes back `None` from the traditional engine.
-  `app.llm.structured_text` returns the parsed object and nothing about which
-  provider or model answered, and the engine will not write a guess into an
-  audit field — `settings.llm_model` is exactly the value `_resolve_model` is
-  documented to override. The fix belongs in `app/llm.py`: report the resolved
-  model alongside the answer.
+- `ExtractionResult.model` comes back `None` from both engines.
+  `app.llm.structured_text` and `structured_vision` return the parsed object and
+  nothing about which provider or model answered, and neither engine will write
+  a guess into an audit field — `settings.llm_model` is exactly the value
+  `_resolve_model` is documented to override. The fix belongs in `app/llm.py`:
+  report the resolved model alongside the answer. It is worse on the vision
+  path, where the model *is* the extraction and the result names only its
+  provider, through `engine`.
+- `app/engines/vlm.py` has no tests. Everything worth pinning is reachable with
+  `app.llm.structured_vision` stubbed and no network: that `_schema_with_transcript`
+  adds `_transcript` while keeping the `items` and `title` fields, and that
+  `app.llm._gemini_schema` still accepts the result; that `_pop_transcript`
+  handles a string, a list of pages, a missing key and a non-dict answer, and
+  that the key never reaches `coerce_fields`; that `text_blocks` and
+  `confidence` stay empty and `None` on a *successful* extraction, not only on a
+  failed one; that the provider named at construction is the one passed to
+  `llm`; that the system prompt carries both the base policy and the vision
+  addendum while the prompt carries no OCR framing; and each failure path — no
+  pages, an encode failure, a raising model call, a non-dict answer, a bad
+  `doc_type`. The registry wants its own: four keys and no more from
+  `available_engines()`, `get_engine` on an unknown key and on each family
+  alias, and that importing `app.engines` imports neither engine module.
+- A long `_transcript` competes with the document for `settings.llm_max_tokens`
+  (8192). On a dense multi-page invoice the answer can be truncated mid-object,
+  which `parse_json_object` then rejects and tenacity retries — three times, at
+  full cost, with the same result. Nothing caps or budgets it yet. Either the
+  transcript gets a length instruction, or `llm_max_tokens` becomes a per-call
+  argument the vision path raises.
 - No test runs a real recogniser. `_read_paddle` and `_read_tesseract` are
   stubbed everywhere, so the SDK calls themselves are unverified against an
   installed engine, and `_paddle_lines` is pinned against result shapes written
