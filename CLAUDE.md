@@ -557,6 +557,67 @@ Built:
   failed; and `field_diff`'s number equality, its numeric path sort and its
   empty column. `settings` is replaced wholesale in every module that reads it
   on this path, so a developer's real `.env` cannot decide an outcome.
+- `api/main.py` — FastAPI, and deliberately a translator and a doorman rather
+  than a layer with opinions. Seven routes: `GET /health`, `GET /v1/engines`,
+  `POST /v1/documents/extract`, `POST /v1/documents/compare`,
+  `GET /v1/documents`, `GET /v1/documents/{id}`,
+  `POST /v1/documents/{id}/approve`.
+  - Nothing in it asks which engine ran. `engine` arrives as a string and is
+    passed to `pipeline.process` as the string it arrived as; the only thing
+    the API does with it is ask `get_engine` whether the registry knows it, so
+    the family aliases and the empty-means-default rule stay defined in
+    `app/engines/__init__.py` and are not restated in an HTTP handler.
+  - The status codes draw one line, and it is the line the pipeline already
+    drew. `process` never raises and reports a document it could not read as
+    `ProcessResult(status="failed", error=...)` — a value a caller can render —
+    so that comes back **200** with `status="failed"` in the body, and a handler
+    catches nothing. The codes are reserved for requests that were malformed
+    before any document was read: empty upload 400, over the size cap 413,
+    unknown `doc_type` 400 listing the valid ones, fewer than two engines on
+    compare 400, unknown engine 400 carrying the registry's own message. A 5xx
+    from this API therefore means the API itself broke, which is a different
+    bug from a document that could not be read, and the distinction stays
+    legible in a log of status codes.
+  - Every refusal has the same shape — a stable `code`, a human `message`, and
+    whatever list makes the message actionable (`valid`, `limit_mb`) — which is
+    how `app.schemas.Issue` spells its findings and for the same reason: the
+    string is for a person, the code is what anything else keys on.
+  - Persistence stays optional here too. The three database-backed routes hang
+    `Depends(_require_database)` and answer 503 naming `DATABASE_URL`;
+    `/extract` and `/compare` never ask. Lifespan calls `db.init_schema()` and
+    logs rather than crashes: a configured database that cannot be reached must
+    not take down the two endpoints that never wanted one, and the endpoints
+    that do want it fail their own request, loudly, when somebody asks.
+  - `/health` does not open a connection. A health check that touches Postgres
+    becomes a load generator the moment a balancer polls it, and would report a
+    merely busy database as a dead API — so `persistence` there means
+    *configured*, not reachable.
+  - `POST /{id}/approve` with no `fields` means "approve what the engine
+    returned", and it is resolved in the handler by reading the stored fields
+    and handing them back. Passing `None` down would be the one way to lose a
+    document through this API: `approve_document` flattens what it is given and
+    diffs it against what is stored, so `None` flattens to `{}`, records every
+    field on the page as deleted, and writes that into the eval set as the
+    answer a human wanted. The extra read has a race the comment names, and the
+    reviewer path — a UI submitting its own `fields` — does not go through it.
+  - The size cap is `MAX_UPLOAD_MB = 25`, a module constant, and it is checked
+    twice: `UploadFile.size` first, because refusing on the parser's count is
+    free, then the length actually read, so a misdeclared part cannot get past
+    it. An oversized body still reaches the process either way; the wall is
+    `client_max_body_size` in front, and this is the backstop.
+  - Extraction runs inline, on the request thread, and the upgrade path is
+    commented on the handler because the point of it is that it stops at the
+    handler: enqueue `(bytes, filename, doc_type, engine, clean_images,
+    persist)` to Redis, return 202 with a job id and a `Location`, have a
+    worker call `pipeline.process` with exactly those arguments and write the
+    result where the status endpoint reads it. Nothing in `app/` changes —
+    `process` is synchronous, takes bytes, never raises and returns one value,
+    which is the shape a queue wants. A 20-page PaddleOCR scan otherwise holds
+    a worker for the better part of a minute.
+  - An empty `api/__init__.py` was added alongside it, which was outside the
+    task's named file: `api.main` is imported as `api.main:app` and a namespace
+    package would have worked by accident on this interpreter and not on the
+    next one. It has no contents and is not expected to grow any.
 
 `sql/schema.sql` and `app/db.py` were run against a real PostgreSQL 16.2 —
 there is no Docker on this machine, so a user-mode cluster on port 55432 rather
@@ -658,7 +719,51 @@ around a provider rather than of the provider. `paddleocr` and `pytesseract`
 are not installed either, so the two traditional engines can currently only run
 the PDF text-layer path.
 
-Not written yet: `api/`, `ui/`, `eval.py`.
+`api/main.py` was run for real — uvicorn on 127.0.0.1:8077, curl against it,
+no mocking anywhere — and the error paths were the point of the exercise, since
+the happy path cannot reach a provider on this machine. Every refusal below is
+a pasted response:
+
+- empty upload → **400** `{"code":"empty_upload","message":"the uploaded file
+  has no bytes in it"}`
+- a 26.0 MB PDF → **413** `{"code":"file_too_large","message":"the upload is
+  26.0 MB and the limit is 25 MB","limit_mb":25}`
+- `doc_type=payslip` → **400** `{"code":"unknown_doc_type","message":"unknown
+  doc_type 'payslip'","valid":["document","invoice","receipt"]}`
+- `engines=traditional:paddle` on compare → **400** `{"code":"too_few_engines",
+  "message":"compare needs at least two engines and got 1; ...","valid":[the
+  four keys]}`
+- `engine=trocr` → **400** `{"code":"unknown_engine"}` carrying
+  `get_engine`'s own message, four keys and both family aliases
+- all three database-backed routes with `DATABASE_URL` unset → **503**
+  `{"code":"persistence_disabled","message":"this endpoint needs Postgres and
+  DATABASE_URL is not set; extraction and comparison work without it"}`
+- a byte string that is not a document → **200**, `status="failed"`,
+  `error="ValueError: could not open 'junk.pdf' as a PDF: Failed to open
+  stream"`, `needs_review=true`. That is the line the codes draw, holding on
+  real bytes: a document that could not be read is an answer, not a 5xx.
+
+Then the same 3-page PDF from the pipeline run above, through
+`POST /v1/documents/extract` with `engine=traditional:paddle` and
+`doc_type=document`: **200**, `status="ok"`, `page_count=3`, `raw_text` 6035
+characters off the text layer, engine time 6.8 ms against 192 ms for the whole
+request — and `document: null` with one `no_document` issue and
+`needs_review=true`, because the model call ended at `LLMError: no API key for
+provider 'gemini'` exactly as it does everywhere else. `stored=false` and
+`document_id=null`, with no database configured and no complaint about it.
+`/v1/documents/compare` across `traditional:paddle,vlm:gemini` returned both
+results, `diff: []` and `agreement: null` — which is `field_diff`'s empty-column
+rule being right rather than a bug: neither engine returned a document, so
+there was nothing to disagree about.
+
+So the API's rejections, its never-raise contract and its no-database contract
+are proven on real requests; **an extraction that actually fills a document is
+still not proven through any path**, and will not be until `app/config.py`
+carries a provider key. The three database-backed routes are proven only at
+their 503 — there is no Postgres on this machine any more, the 16.2 cluster
+below having been a user-mode one that is gone.
+
+Not written yet: `ui/`, `eval.py`.
 
 Known gaps:
 
@@ -674,10 +779,12 @@ Known gaps:
   default, which is a workaround for the Anthropic defaults and not a feature;
   and `settings.llm_enabled` still reports on the Anthropic key, so it is now
   wrong. `.env.example` needs the same fields. Config was outside this task's
-  scope, so none of it was touched — and it is now the gap that blocks
+  scope, so none of it was touched — and it is still the gap that blocks
   everything else: with no field to carry a key, `Settings`' `extra="ignore"`
   drops `GEMINI_API_KEY` out of `.env` silently and every engine fails at the
-  model call. This is the next thing to fix, before `api/` or `ui/`.
+  model call. The API is now written and demonstrably answers, so this is the
+  one thing standing between it and an extraction that fills a document. Fix it
+  before `ui/`.
 - The page cap has no home in settings. `load_document` takes `max_pages` as a
   keyword argument and otherwise reads `settings.max_pages` if it appears,
   falling back to a module constant. Add the field to `app/config.py` and drop
@@ -847,6 +954,54 @@ Known gaps:
   1200x1500 in, 807x1105 out against an 800x1100 original, residual skew 0.0
   degrees, and a flat scan passing through at its own size. That script lives
   outside the repo; the checks belong in `tests/test_preprocess.py`.
+- **The repo has no dependency file at all.** There is no `requirements.txt`,
+  no `pyproject.toml`, nothing — and `api/main.py` has now added `fastapi`,
+  `uvicorn` and `python-multipart` to the list of things that have to be
+  installed by hand before anything runs. That was survivable while the repo
+  was a library; it is not survivable now that it has a server somebody else is
+  expected to start. One file, and the pins for the two SDK families and
+  psycopg belong in it too.
+- The upload cap is `MAX_UPLOAD_MB = 25` in `api/main.py` and
+  `settings.max_upload_mb` is 20, and the two are not connected. The task named
+  25 and the limit a client is refused by has to be the documented one, so the
+  constant won; it is the only number in the repo read from somewhere other
+  than `app.config`. Raise the config field to 25 and delete the constant —
+  and note this is the third thing waiting on a config edit, after the provider
+  keys and the page cap.
+- `api/main.py` has no tests. Everything worth pinning runs under
+  `fastapi.testclient.TestClient` with no network and no database, which is
+  exactly the shape `tests/` already requires: each of the five refusals and
+  its `code`, the 503 on all three database routes with `settings.database_url`
+  empty, the 200-with-`status="failed"` for bytes that will not load — the one
+  that guards the line the whole module draws — the size cap on both the
+  declared and the actual length, and that `/v1/engines` lists four keys and no
+  more. `app.llm.structured_text` stubbed the way `tests/test_pipeline.py`
+  stubs it would also pin the shape of a *successful* extract response, which
+  is the one shape nothing anywhere has yet seen.
+- `POST /v1/documents/{id}/approve` with no body reads the document, then
+  `approve_document` reads it again under `FOR UPDATE`. A correction committed
+  between the two would be approved away. The fix is a `corrected_fields`
+  sentinel in `app/db.py` meaning "whatever is stored", resolved inside the
+  transaction — which is `app/db.py`'s to make, not the API's, and is the same
+  shape as the `_same`/`_path_key` privacy problem already listed above.
+- Neither `/extract` nor `/compare` trims what it returns. `text_blocks` is
+  every OCR line on every page with its box, and `compare` returns N of those
+  at once — a five-page PaddleOCR comparison is a response measured in
+  megabytes. A `?include=` or a `text_blocks=false` form field is a few lines;
+  nobody has run it against a real recogniser to find out where the threshold
+  actually bites.
+- `ProcessResult.comparison` and `agreement` still have no producer, and
+  `/v1/documents/compare` is now the endpoint that could have one — it holds N
+  results and the caller knows which pair it cared about. It deliberately does
+  not: nothing stores a comparison, and picking two of five engines on the
+  user's behalf is the arbitrary selection `app/pipeline.py` declined to make.
+  The endpoint that resolves it is a "keep this comparison" call the review UI
+  makes, which is `ui/`'s to ask for.
+- Nothing authenticates. Every route is open, `reviewed_by` is a string the
+  client supplies and nothing checks, and the corrections table is therefore
+  attributable only as far as the caller is honest. That is fine for a local
+  deployment and is not fine for a shared one; whatever answers it has to
+  answer for `ui/` too, so it belongs above both.
 
 ## Conventions
 
