@@ -19,6 +19,18 @@ Run locally with:
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Streamlit Community Cloud's launcher only puts this file's own directory
+# (ui/) on sys.path, not the repository root -- `app` lives beside `ui/`, not
+# inside it, so "from app.config import settings" fails with
+# ModuleNotFoundError there even though it works locally, where `streamlit
+# run` is typically launched with the repo root already on sys.path. Adding
+# the repo root explicitly, relative to this file, makes the import work
+# regardless of how or from where the process was started.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import streamlit as st
 
 from app.config import settings
