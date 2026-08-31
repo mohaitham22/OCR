@@ -131,6 +131,60 @@ Built:
     follow falls back to dropping the top-level key the path started at, and a
     pass that removes nothing ends the loop rather than spinning; only then
     does the document come back as `None`.
+- `app/engines/traditional.py` — the OCR backend, in two deliberately separable
+  stages: a recogniser reads pixels into `TextBlock`s, then a text model maps
+  those onto the schema. The seam between them is a string plus boxes, and that
+  is what buys the review UI coordinates and per-line confidences and what lets
+  stage two be swapped for rules or LayoutLM later without a line of stage one
+  changing.
+  - `TraditionalExtractor(backend="paddle" | "tesseract")` sets `key` and
+    `label` per instance — `traditional:paddle` and `traditional:tesseract` are
+    two registry entries, because running one recogniser against the other is
+    the comparison someone will want. The class-level `key` and `label` exist
+    so the base's `__init_subclass__` check passes at import and so a bare
+    `traditional` still names something. `gives_boxes = True`.
+  - Both recognisers are imported inside the method that uses them, and a
+    missing one is a `RuntimeError` naming the command that fixes it —
+    `pip install paddleocr paddlepaddle`, or `pip install pytesseract` plus the
+    binary. Paddle readers are cached per language behind a lock: construction
+    loads three models from disk and costs seconds, and two web threads must
+    not build the same reader and throw one away. `lang="arabic"` when `ar` is
+    in `settings.languages`, since that model reads Latin digits too.
+  - `_construct_paddle` walks a kwargs cascade because PaddleOCR 2.x wants
+    `use_angle_cls` and `show_log` and 3.x rejects both outright. Only that
+    rejection is caught; a constructor failing because the models will not
+    download stays a failure. `_paddle_lines` normalises the three result
+    shapes those generations return — 3.x's parallel `rec_*` lists, 2.x's
+    `[polygon, (text, score)]` per page, and the older unwrapped page — so
+    nothing above it branches on a Paddle version.
+  - Tesseract's per-word rows are regrouped into lines, so both recognisers
+    emit the same unit and `reading_order_text` and the UI never learn which
+    one ran. Words are joined in Tesseract's own word order, not by position:
+    inside a line that order is already the logical one, which is what an
+    Arabic line needs. Confidences are normalised to 0–1 from Paddle's 0–1 and
+    Tesseract's 0–100, `conf = -1` is a box with no text in it, and anything
+    under `settings.ocr_min_confidence` is dropped and counted in a log line.
+  - `reading_order_text(blocks, line_tolerance=12)` undoes detection order:
+    blocks are grouped into lines by vertical proximity and sorted within a
+    line by left edge. The line's centre is a running mean, so a column of
+    near-misses does not extend one line down the whole page. Boxes are left in
+    left-to-right order for Arabic too, and the comment saying why sits on the
+    sort where someone will find it before "fixing" it: the recogniser already
+    emits each box's characters in logical order, so reversing boxes by script
+    would swap the label and the amount on every mixed row. A block with no box
+    keeps its arrival order at the end of its page rather than being guessed
+    into a row.
+  - `extract` skips the recogniser entirely when `embedded_text` is present:
+    that text is exact, and rendering it to pixels and reading them back can
+    only lose characters. Overall confidence is the block confidences weighted
+    by text length — an unweighted mean lets one misread character count as
+    much as the line carrying the total — and it is `None` on the text-layer
+    path, where no recogniser ran and 1.0 would be a claim about the extraction
+    rather than about the transcription. Failure never leaves the engine: a
+    backend that will not load, a page with no text and a model call that
+    raises all come back as an `ExtractionResult` with `document=None`, keeping
+    whatever OCR text was already paid for. An unknown `doc_type` is the one
+    exception — that is a caller bug, and it raises before the clock starts.
 - `tests/test_preprocess.py` — both triage directions, the threshold boundary,
   the page cap, images and failure modes, on PDFs built in memory. Loading
   only; the correction half is not covered yet.
@@ -140,6 +194,16 @@ Built:
   is asserted against `google.genai.types.Schema` as well as for the absence of
   `$ref`, `$defs` and `anyOf`, because the string check alone would pass on a
   schema Gemini still rejects.
+- `tests/test_traditional.py` — 34 tests, no recogniser imported and no
+  network. Every reading-order test feeds its blocks scrambled, because
+  pre-sorted input is passed by the identity function and proves nothing: a
+  receipt fed bottom-up and right-to-left, twenty seeded shuffles of the same
+  four blocks, an amount detected before its label, and a mixed Arabic/Latin
+  row that pins the box-order decision. Also the tolerance boundary and the
+  running mean, both `extract` paths and each of its four failure modes, the
+  confidence weighting, the three Paddle result shapes and the Tesseract
+  word-to-line regrouping. `settings` is replaced wholesale where it is read,
+  so a developer's real `.env` cannot decide an outcome.
 
 Two decisions in the correction half came out of watching it fail, and should
 not be quietly reverted:
@@ -162,9 +226,16 @@ the model is asked to fill. `tests/test_llm.py` pins both. `_shrink` in
 `app/engines/base.py` walks the same shape and carries the same trap; it has no
 test yet.
 
+A fourth, in `reading_order_text`, looks like a bug until you read the comment
+on it: boxes are sorted left to right for Arabic as well. The recogniser emits
+each box's characters in logical order already, so the only thing left to order
+is the boxes, and reversing them by script breaks every mixed row — the Arabic
+label and the Latin amount trade places, and a run of one script inside a line
+of the other lands at the wrong end. `tests/test_traditional.py` pins it.
+
 Not written yet: `app/validate.py`, `app/db.py`, `app/pipeline.py`,
-`app/engines/traditional.py`, `app/engines/vlm.py`, the `app/engines/__init__.py`
-registry, `api/`, `ui/`, `sql/`, `eval.py`.
+`app/engines/vlm.py`, the `app/engines/__init__.py` registry, `api/`, `ui/`,
+`sql/`, `eval.py`.
 
 Known gaps:
 
@@ -188,7 +259,7 @@ Known gaps:
 - The repo carries no pytest configuration, so pytest resolves its rootdir from
   ancestor directories. On the current machine it finds `C:\Users\mooda\setup.cfg`
   and aborts before collection with a `UnicodeDecodeError`, so plain `pytest -q`
-  does not run at all; `pytest -c <any empty ini> --rootdir=. tests` passes 51
+  does not run at all; `pytest -c <any empty ini> --rootdir=. tests` passes 85
   tests. A `pytest.ini` at the repo root fixes it.
 - `coerce_fields` returns `(document, list[Issue])` and `ExtractionResult` has
   nowhere to put the issues, so an engine can only log them. `ProcessResult`
@@ -196,6 +267,8 @@ Known gaps:
   collects them from the engine somehow or `ExtractionResult` grows a field.
   Decide it when `app/pipeline.py` is written, before both engines have
   invented their own answer. The `Issue` shape is already right for either.
+  `app/engines/traditional.py` logs them at WARNING in the meantime, which is a
+  placeholder and not the answer: a reviewer cannot see a log line.
 - OpenAI and DeepSeek see the schema twice: `build_prompt` embeds the compact
   one and `app.llm._json_instruction` appends the full Pydantic one to the
   system message. Gemini sees the compact one in the prompt and the sanitised
@@ -209,6 +282,25 @@ Known gaps:
   after the array-collapsing pass in `_dumps`, that the OCR framing appears
   only with `source_text`, and each `coerce_fields` path — clean, one bad
   scalar, a bad line item, a bad `doc_type`, and a non-dict.
+- `used_text_layer` has nowhere to live. The traditional engine knows whether
+  it read the PDF's text layer or the pixels — the two produce results of very
+  different quality and the review UI wants to say which — but
+  `ExtractionResult` carries no such field and `app/schemas.py` was outside
+  this task's scope, so for now the engine only logs it. Add the field, or have
+  `app/pipeline.py` carry the flag; decide it with the `Issue` question above,
+  since both are the same missing channel between an engine and its result.
+- `ExtractionResult.model` comes back `None` from the traditional engine.
+  `app.llm.structured_text` returns the parsed object and nothing about which
+  provider or model answered, and the engine will not write a guess into an
+  audit field — `settings.llm_model` is exactly the value `_resolve_model` is
+  documented to override. The fix belongs in `app/llm.py`: report the resolved
+  model alongside the answer.
+- No test runs a real recogniser. `_read_paddle` and `_read_tesseract` are
+  stubbed everywhere, so the SDK calls themselves are unverified against an
+  installed engine, and `_paddle_lines` is pinned against result shapes written
+  from the docs rather than captured from a run. The kwargs cascade in
+  `_construct_paddle` is untested for the same reason. A test marked to skip
+  when the backend is absent would cover it.
 - The correction half has no unit tests. It was verified visually instead — a
   synthetic page shot at 6 degrees on a grey desk under a lighting gradient,
   1200x1500 in, 807x1105 out against an 800x1100 original, residual skew 0.0
