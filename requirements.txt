@@ -26,7 +26,7 @@ tenacity==8.2.3
 
 # --- Preprocessing (app/preprocess.py): PDF triage, image ops ------------
 numpy==1.26.4
-opencv-python==4.13.0.90
+opencv-python==4.11.0.86
 pymupdf==1.27.2.2
 
 # --- Traditional engine, tesseract backend (app/engines/traditional.py) --
